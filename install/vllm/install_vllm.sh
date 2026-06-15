@@ -119,9 +119,12 @@ run_pip_clean "$PIP_RUNNER install '$VLLM_WHEEL_URL'"
 echo "==> Bumping compressed-tensors to a transformers>=5-compatible version..."
 run_pip_clean "$PIP_RUNNER install 'compressed-tensors>=0.15.0'"
 
-# The PyPI vllm wheel caps transformers<5, but axon requires >=5.3.0.
+# The PyPI vllm wheel caps transformers<5, but axon requires the exact pin.
+# Must match install/dependencies/requirements-base.txt (transformers==5.5.3) and the
+# dev-mode branch above; a floating '>=5.3.0' here silently drifts user-mode installs to
+# the latest 5.x (e.g. 5.12.0) while dev-mode stays at 5.5.3, so the two modes diverge.
 echo "==> Restoring transformers to axon-compatible version..."
-run_pip_clean "$PIP_RUNNER install 'transformers>=5.3.0'"
+run_pip_clean "$PIP_RUNNER install 'transformers==5.5.3'"
 
 # Locate the installed vllm package
 VLLM_INSTALL_DIR=$(python -c "import vllm, pathlib; print(pathlib.Path(vllm.__file__).parent)")
