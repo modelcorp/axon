@@ -162,7 +162,8 @@ def _patch_filesystem_writer_preserve_mcore_data():
 
         try:
             with open(metadata_path, "rb") as f:
-                written = _pickle.load(f)
+                # Trusted local checkpoint metadata written by this framework, not untrusted input.
+                written = _pickle.load(f)  # nosec B301
             for attr, value in preserved.items():
                 setattr(written, attr, value)
             tmp_path = str(metadata_path) + ".mcore_preserve.tmp"
@@ -173,15 +174,14 @@ def _patch_filesystem_writer_preserve_mcore_data():
             logger.warning("Failed to re-attach mcore_data to %s: %s", metadata_path, e)
 
     def _finish_preserving_extra_attrs(self, metadata, results):
-        preserved = {
-            attr: getattr(metadata, attr) for attr in _PRESERVED_ATTRS if hasattr(metadata, attr)
-        }
+        preserved = {attr: getattr(metadata, attr) for attr in _PRESERVED_ATTRS if hasattr(metadata, attr)}
         _orig_finish(self, metadata, results)
         if not preserved:
             return
         import os as _os
 
         from torch.distributed.checkpoint.filesystem import _metadata_fn
+
         metadata_path = self._get_metadata_path() if hasattr(self, "_get_metadata_path") else None
         if metadata_path is None:
             metadata_path = _os.path.join(str(self.path), _metadata_fn)
@@ -193,15 +193,12 @@ def _patch_filesystem_writer_preserve_mcore_data():
     from megatron.core.dist_checkpointing.strategies.filesystem_async import (
         FileSystemWriterAsync,
     )
+
     if FileSystemWriterAsync.finish is not _finish_preserving_extra_attrs:
         _orig_async_finish = FileSystemWriterAsync.finish
 
         def _async_finish_preserving_extra_attrs(self, metadata, results):
-            preserved = {
-                attr: getattr(metadata, attr)
-                for attr in _PRESERVED_ATTRS
-                if hasattr(metadata, attr)
-            }
+            preserved = {attr: getattr(metadata, attr) for attr in _PRESERVED_ATTRS if hasattr(metadata, attr)}
             _orig_async_finish(self, metadata, results)
             if not preserved:
                 return

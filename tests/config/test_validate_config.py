@@ -18,9 +18,9 @@ from axon.config.validate_config import (
     needs_reference_policy,
     validate_actor_config,
     validate_algorithm_config,
+    validate_axon_config,
     validate_data_config,
     validate_loss_config,
-    validate_axon_config,
     validate_sampler_config,
 )
 

@@ -152,7 +152,8 @@ def load_dataset(
                 from datasets import load_dataset as hf_load_dataset
 
                 logger.info("Downloading dataset from Hugging Face %s (split=%s) to %s", repo_id, split, file_path)
-                hf_ds = hf_load_dataset(repo_id, split=split)
+                # repo_id is operator-supplied dataset; HF revision pinning N/A.
+                hf_ds = hf_load_dataset(repo_id, split=split)  # nosec B615
                 if rename_map:
                     # Drop columns not referenced in the rename map and rename the rest.
                     keep = set(rename_map.keys())

@@ -49,6 +49,7 @@ def ensure_flashinfer_real_libcudart() -> None:
         # real libcudart as long as tilelang's stub is not yet loaded. The binding is
         # cached on the module, so later imports (vLLM init_device) reuse it.
         import flashinfer.comm.cuda_ipc  # noqa: F401
+
         logger.debug("Pre-bound flashinfer cudart to the real libcudart.")
     except Exception as e:  # best-effort; never block worker startup
         logger.debug("flashinfer cudart pre-bind skipped: %s", e)

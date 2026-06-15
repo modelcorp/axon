@@ -154,8 +154,8 @@ def get_tool_call_parser(name: str, **kwargs) -> ToolCallParser:
 def _register_builtin_parsers():
     """Import all built-in parser modules to trigger registration."""
     # These imports have side effects (registration via decorator)
-    import axon.tools.parsers.glm_parser  # noqa: F401
     import axon.tools.parsers.gemma4_parser  # noqa: F401
+    import axon.tools.parsers.glm_parser  # noqa: F401
     import axon.tools.parsers.json_parser  # noqa: F401
     import axon.tools.parsers.openai_harmony_parser  # noqa: F401
     import axon.tools.parsers.qwen_parser  # noqa: F401

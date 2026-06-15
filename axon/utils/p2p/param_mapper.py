@@ -179,9 +179,7 @@ def get_megatron_param_metadata(
                         # Determine which parallel group this parameter belongs to.
                         # Gemma4-style SequentialMLP exposes experts under
                         # `.local_experts.`; either path uses the ETP group.
-                        is_expert_param = (
-                            ".mlp.experts." in global_name or ".local_experts." in global_name
-                        )
+                        is_expert_param = ".mlp.experts." in global_name or ".local_experts." in global_name
 
                         if is_expert_param:
                             # Expert parameters use ETP group

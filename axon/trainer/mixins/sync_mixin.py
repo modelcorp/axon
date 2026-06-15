@@ -14,8 +14,6 @@
 
 """Sync trainer mixins for switching between trainer and sampler modes."""
 
-import torch
-
 from axon.utils.memory_utils import aggressive_empty_cache
 from axon.utils.torch import set_expandable_segments
 

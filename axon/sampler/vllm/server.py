@@ -549,7 +549,8 @@ class vLLMHttpServerBase:
         if os.environ.get("AXON_MOE_REPLAY") == "1":
             from transformers import AutoConfig
 
-            _hf_cfg = AutoConfig.from_pretrained(self.config.model_path, trust_remote_code=False)
+            # model_path is operator-supplied (same model the run trains); HF revision pinning N/A.
+            _hf_cfg = AutoConfig.from_pretrained(self.config.model_path, trust_remote_code=False)  # nosec B615
             _text_cfg = getattr(_hf_cfg, "text_config", _hf_cfg)
             _has_moe = bool(
                 getattr(_text_cfg, "num_experts", None)

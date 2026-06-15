@@ -235,9 +235,7 @@ def _format_parameters(properties: dict, required: list | None, filter_keys: boo
                         continue
                     if item_key == "properties" and isinstance(item_value, dict):
                         item_parts.append(
-                            "properties:{"
-                            + _format_parameters(item_value, items.get("required", []))
-                            + "}"
+                            "properties:{" + _format_parameters(item_value, items.get("required", [])) + "}"
                         )
                     elif item_key == "required":
                         item_parts.append("required:" + _format_required(item_value))

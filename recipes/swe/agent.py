@@ -21,6 +21,7 @@ try:
 except ImportError:
     SWEAction = None
 
+from axon.core import Action, BaseAgent, register_agent
 from recipes.swe.prompts import (
     SWE_SYSTEM_PROMPT,
     SWE_SYSTEM_PROMPT_FN_CALL,
@@ -29,7 +30,6 @@ from recipes.swe.prompts import (
     SWEAGENT_SYSTEM_PROMPT,
     SWEAGENT_USER_PROMPT,
 )
-from axon.core import Action, BaseAgent, register_agent
 
 TOKEN_WARNING_THRESHOLD = 28000
 

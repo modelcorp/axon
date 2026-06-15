@@ -3,9 +3,9 @@ import json
 import os
 
 import pandas as pd
+from datasets import load_dataset
 
 import axon
-from datasets import load_dataset
 
 # Get the directory for Axon repo (axon.__file__)
 AXON_DIR = os.path.dirname(os.path.dirname(os.path.abspath(axon.__file__)))

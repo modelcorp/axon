@@ -613,7 +613,9 @@ class Gemma4ChatTemplateParser(ChatTemplateParser):
                 if part_type in Gemma4ChatTemplateParser._TEXT_PART_TYPES:
                     rendered.append((part.get("text", "") or "").strip() + " ")
                 elif part_type in Gemma4ChatTemplateParser._MEDIA_PART_TYPES:
-                    raise ValueError("Gemma4ChatTemplateParser is text-only; use a multimodal parser for media content.")
+                    raise ValueError(
+                        "Gemma4ChatTemplateParser is text-only; use a multimodal parser for media content."
+                    )
             return "".join(rendered)
         return ""
 
@@ -629,7 +631,9 @@ class Gemma4ChatTemplateParser(ChatTemplateParser):
                 if part_type in Gemma4ChatTemplateParser._TEXT_PART_TYPES:
                     text += part.get("text") or ""
                 elif part_type in Gemma4ChatTemplateParser._MEDIA_PART_TYPES:
-                    raise ValueError("Gemma4ChatTemplateParser is text-only; use a multimodal parser for media content.")
+                    raise ValueError(
+                        "Gemma4ChatTemplateParser is text-only; use a multimodal parser for media content."
+                    )
             return text
         return content
 
@@ -648,7 +652,9 @@ class Gemma4ChatTemplateParser(ChatTemplateParser):
                     text = part.get("text") or ""
                     rendered.append(text if role == "model" else text.strip())
                 elif part_type in Gemma4ChatTemplateParser._MEDIA_PART_TYPES:
-                    raise ValueError("Gemma4ChatTemplateParser is text-only; use a multimodal parser for media content.")
+                    raise ValueError(
+                        "Gemma4ChatTemplateParser is text-only; use a multimodal parser for media content."
+                    )
             return "".join(rendered)
         return ""
 
