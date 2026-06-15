@@ -220,11 +220,21 @@ class CausalLM:
         if "multi_modal_inputs" in batch:
             from axon.utils.hf_model import extract_multi_modal_inputs
 
-            # Don't pass multi_modal_inputs_idx: the micro-batch split already sliced
-            # batch["multi_modal_inputs"] to this partition, so indexing by original-row
-            # ids would double-index and drop pixel_values -> "video token start index"
-            # mismatch in mbridge. The FSDP path likewise passes no idx.
-            multi_modal_inputs = extract_multi_modal_inputs(batch["multi_modal_inputs"])
+            # multi_modal_inputs rides through the dynamic micro-batch split as a TensorDict
+            # NonTensorData scalar, which index_select_tensor_dict does NOT slice — so every
+            # micro-batch carries the FULL (all-rows) mm array. The sliced multi_modal_inputs_idx
+            # tensor holds THIS micro-batch's original row positions; use it to select the matching
+            # grids so they align 1:1 with input_ids. (mbridge get_rope_index rebuilds mRoPE with a
+            # single global image_index and raises a shape mismatch on any row<->grid desync — which
+            # is exactly what happens at >1 micro-batch if we concat the full grid set.) Guard: if the
+            # array is already sliced to this micro-batch (len == n_rows), use it as-is — the idx
+            # would be out of range and drop every row.
+            _mm = batch["multi_modal_inputs"]
+            _mm_idx = batch.get("multi_modal_inputs_idx", None)
+            if _mm_idx is not None and len(_mm) > batch["input_ids"].shape[0]:
+                multi_modal_inputs = extract_multi_modal_inputs(_mm, _mm_idx.tolist())
+            else:
+                multi_modal_inputs = extract_multi_modal_inputs(_mm)
 
         # Labels are input_ids shifted left by 1: label[t] = input_ids[t+1]
         label = torch.zeros_like(input_ids)
@@ -529,11 +539,15 @@ class ValueModel:
         if "multi_modal_inputs" in batch:
             from axon.utils.hf_model import extract_multi_modal_inputs
 
-            # Don't pass multi_modal_inputs_idx: the micro-batch split already sliced
-            # batch["multi_modal_inputs"] to this partition, so indexing by original-row
-            # ids would double-index and drop pixel_values -> "video token start index"
-            # mismatch in mbridge. The FSDP path likewise passes no idx.
-            multi_modal_inputs = extract_multi_modal_inputs(batch["multi_modal_inputs"])
+            # See CausalLM.forward_step: multi_modal_inputs is the FULL (unsliced) mm array on
+            # every micro-batch; select this micro-batch's rows via the sliced idx so grids align
+            # 1:1 with input_ids (mbridge get_rope_index global-image_index desyncs otherwise).
+            _mm = batch["multi_modal_inputs"]
+            _mm_idx = batch.get("multi_modal_inputs_idx", None)
+            if _mm_idx is not None and len(_mm) > batch["input_ids"].shape[0]:
+                multi_modal_inputs = extract_multi_modal_inputs(_mm, _mm_idx.tolist())
+            else:
+                multi_modal_inputs = extract_multi_modal_inputs(_mm)
 
         from axon.models.mcore import get_mcore_forward_fn
 
@@ -686,9 +700,14 @@ class RewardModel:
         if "multi_modal_inputs" in batch:
             from axon.utils.hf_model import extract_multi_modal_inputs
 
-            # See note above: micro-batch mm list is already sliced; passing the
-            # original-row idx would double-index and drop pixel_values.
-            multi_modal_inputs = extract_multi_modal_inputs(batch["multi_modal_inputs"])
+            # See CausalLM.forward_step: full (unsliced) mm array per micro-batch; select this
+            # micro-batch's rows via the sliced idx so grids align 1:1 with input_ids.
+            _mm = batch["multi_modal_inputs"]
+            _mm_idx = batch.get("multi_modal_inputs_idx", None)
+            if _mm_idx is not None and len(_mm) > batch["input_ids"].shape[0]:
+                multi_modal_inputs = extract_multi_modal_inputs(_mm, _mm_idx.tolist())
+            else:
+                multi_modal_inputs = extract_multi_modal_inputs(_mm)
 
         from axon.models.mcore import get_mcore_forward_fn
 
