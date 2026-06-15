@@ -71,21 +71,21 @@ print(getattr(vllm, '__version__', 'unknown'))
     echo ">>> MAX_JOBS=$MAX_JOBS NVCC_THREADS=$NVCC_THREADS TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST:-auto}"
     run_pip_clean "$PIP_RUNNER install --editable '$VLLM_DEV_PATH' --no-deps --no-build-isolation"
 
-    # Install vllm's runtime deps. Strip the compressed-tensors==0.14.0.1
-    # pin (which caps transformers<5) so we get the 0.15+ version compatible
-    # with axon's transformers>=5.3.0.
-    echo "==> Installing vllm runtime dependencies..."
-    VLLM_REQS_FILTERED=$(mktemp)
-    grep -v '^compressed-tensors' "$VLLM_DEV_PATH/requirements/common.txt" > "$VLLM_REQS_FILTERED"
-    echo "compressed-tensors>=0.15.0" >> "$VLLM_REQS_FILTERED"
-    run_pip_clean "$PIP_RUNNER install -r '$VLLM_REQS_FILTERED'"
-    rm -f "$VLLM_REQS_FILTERED"
+    # Install vllm's CUDA runtime deps from cuda.txt (NOT just common.txt). cuda.txt
+    # does `-r common.txt` and adds the GPU/Blackwell extras the user-mode wheel bundles:
+    # flashinfer-cubin, nvidia-cutlass-dsl and quack-kernels (the FA4 cute-DSL path on
+    # sm_100/B200) plus numba. Installing only common.txt here left dev-mode without FA4,
+    # so a dev install on Blackwell diverged from (and underperformed) the user-mode wheel.
+    echo "==> Installing vllm CUDA runtime dependencies (cuda.txt)..."
+    run_pip_clean "$PIP_RUNNER install -r '$VLLM_DEV_PATH/requirements/cuda.txt'"
 
-    echo "==> Restoring transformers to axon-compatible version..."
-    # Must match the pin in install/dependencies/requirements-base.txt (transformers==5.5.3).
-    # vllm's own requirements can pull a different transformers; restore the exact
-    # axon-compatible version rather than '>=', which would float past the pin on a
-    # fresh install once a newer transformers is published.
+    # cuda.txt -> common.txt pins compressed-tensors==0.14.0.1, which caps transformers<5.
+    # Override it (then restore the exact transformers pin) the same way the user-mode path
+    # does — sequentially, so the resolver doesn't see the two constraints at once.
+    echo "==> Overriding compressed-tensors / transformers to axon-compatible versions..."
+    run_pip_clean "$PIP_RUNNER install 'compressed-tensors>=0.15.0'"
+    # Must match install/dependencies/requirements-base.txt (transformers==5.5.3) and the
+    # user-mode path; '>=' would float past the pin on a fresh install.
     run_pip_clean "$PIP_RUNNER install 'transformers==5.5.3'"
 
     echo "==> vllm dev install complete."
