@@ -15,4 +15,3 @@
 
 VALID_TOKEN_REDUCE = {"sum", "mean", "mean-norm", "mean-program"}
 VALID_BATCH_REDUCE = {"token-mean", "step-mean", "program-mean"}
-

@@ -14,8 +14,8 @@
 import re
 from typing import Any
 
-from recipes.search_r1.prompts import SEARCH_R1_SYSTEM_PROMPT
 from axon.core import Action, BaseAgent, register_agent
+from recipes.search_r1.prompts import SEARCH_R1_SYSTEM_PROMPT
 
 
 @register_agent("search_r1")

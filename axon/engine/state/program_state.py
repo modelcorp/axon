@@ -106,7 +106,6 @@ class ModelOutput:
         )
 
 
-
 class TerminationReason(Enum):
     PROMPT_TRUNCATION = "PROMPT_TRUNCATION"
     MAX_STEPS = "MAX_STEPS"

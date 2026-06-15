@@ -18,11 +18,11 @@ The script generates:
 import argparse
 import os
 
-import numpy as np
-
 import datasets
-import axon
+import numpy as np
 from datasets import Dataset
+
+import axon
 
 # Get the directory for Axon repo (axon.__file__)
 AXON_DIR = os.path.dirname(os.path.dirname(os.path.abspath(axon.__file__)))

@@ -28,6 +28,7 @@ Endpoints
 The OpenAI-compatible surface (``/v1/chat/completions``, ``/v1/models``,
 ``/tokenize``) lives in :mod:`axon.engine.server.oai_router`.
 """
+
 from __future__ import annotations
 
 import logging

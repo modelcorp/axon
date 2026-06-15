@@ -27,8 +27,8 @@ from browsergym.core.action.highlevel import HighLevelActionSet  # type: ignore[
 from browsergym.utils.obs import flatten_axtree_to_str, flatten_dom_to_str, prune_html  # type: ignore[import-untyped]
 from PIL import Image
 
-from recipes.miniwob.prompts import SYSTEM_MINIWOB_PROMPT_WITHOUT_THOUGHT
 from axon.core import Action, BaseAgent, register_agent
+from recipes.miniwob.prompts import SYSTEM_MINIWOB_PROMPT_WITHOUT_THOUGHT
 
 logger = logging.getLogger(__name__)
 

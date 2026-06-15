@@ -1,8 +1,8 @@
 """Tests for recipes/router/agent.py — parse_xml_response and RouterAgent."""
 
-from recipes.router.agent import RouterAgent, parse_xml_response
 from axon.core import Action
 from axon.tools.types import ToolCall
+from recipes.router.agent import RouterAgent, parse_xml_response
 
 # ---------------------------------------------------------------------------
 # parse_xml_response

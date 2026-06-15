@@ -48,9 +48,7 @@ _SKIP_PREFIXES = (
 
 
 def override_param(*, full_param_name, module, param, tp_size, split_idx, sampler_parameters):
-    if full_param_name == "lm_head.weight" or any(
-        full_param_name.startswith(p) for p in _SKIP_PREFIXES
-    ):
+    if full_param_name == "lm_head.weight" or any(full_param_name.startswith(p) for p in _SKIP_PREFIXES):
         return []
 
     if not full_param_name.endswith("self_attn.qkv_proj.weight"):
@@ -69,9 +67,9 @@ def override_param(*, full_param_name, module, param, tp_size, split_idx, sample
 
     entries = []
     for slot, start, sz, full_heads, sidx in (
-        ("q", 0,              q_sz,  hn,  split_idx),
-        ("k", q_sz,           kv_sz, kvn, kv_idx),
-        ("v", q_sz + kv_sz,   kv_sz, kvn, kv_idx),
+        ("q", 0, q_sz, hn, split_idx),
+        ("k", q_sz, kv_sz, kvn, kv_idx),
+        ("v", q_sz + kv_sz, kv_sz, kvn, kv_idx),
     ):
         name = full_param_name.replace("qkv_proj", f"{slot}_proj")
         view = param[start : start + sz]
@@ -95,9 +93,7 @@ def extra_buffers(vllm_model):
     out = []
     for mod_name, module in vllm_model.named_modules():
         buf = module._buffers.get("layer_scalar")
-        if buf is None or "layer_scalar" in getattr(
-            module, "_non_persistent_buffers_set", set()
-        ):
+        if buf is None or "layer_scalar" in getattr(module, "_non_persistent_buffers_set", set()):
             continue
         out.append((f"{mod_name}.layer_scalar" if mod_name else "layer_scalar", buf))
     return out

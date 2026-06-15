@@ -22,7 +22,9 @@ with custom configurations and weight loading logic.
 try:
     from .gemma4 import Gemma4Bridge
 except ImportError as _gemma4_err:
-    print(f"[mbridge] Gemma4Bridge unavailable: {_gemma4_err}. Install a transformers version with gemma4 support to enable it.")
+    print(
+        f"[mbridge] Gemma4Bridge unavailable: {_gemma4_err}. Install a transformers version with gemma4 support to enable it."
+    )
     Gemma4Bridge = None
 
 from .glm4 import GLM4Bridge

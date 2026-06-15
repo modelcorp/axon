@@ -27,12 +27,11 @@ import json
 import logging
 import warnings
 
+import datasets
 import numpy as np
 import uvicorn
 from fastapi import FastAPI
 from pydantic import BaseModel
-
-import datasets
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)

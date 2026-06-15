@@ -333,8 +333,8 @@ class TestGemma4ChatTemplateParser:
             {"role": "tool", "tool_call_id": "call_1", "content": "sunny"},
         ]
         result = parser.parse(messages, add_generation_prompt=True)
-        assert "<|tool_call>call:get_weather{city:<|\"|>SF<|\"|>}<tool_call|>" in result
-        assert "<|tool_response>response:get_weather{value:<|\"|>sunny<|\"|>}<tool_response|>" in result
+        assert '<|tool_call>call:get_weather{city:<|"|>SF<|"|>}<tool_call|>' in result
+        assert '<|tool_response>response:get_weather{value:<|"|>sunny<|"|>}<tool_response|>' in result
         assert result.endswith("<tool_response|>")
         assert not result.endswith("<tool_response|><|turn>model\n<|channel>thought\n<channel|>")
 
@@ -377,7 +377,7 @@ class TestGemma4ChatTemplateParser:
         assert "<turn|>\n<|turn>model" not in result[result.index("<|tool_call>") :]
 
     def test_tool_parser_extracts_gemma_tool_calls(self, parser):
-        response = "Let me check.<|tool_call>call:get_weather{city:<|\"|>SF<|\"|>,count:2}<tool_call|>"
+        response = 'Let me check.<|tool_call>call:get_weather{city:<|"|>SF<|"|>,count:2}<tool_call|>'
         tool_calls, remaining = parser.tool_parser.parse(response)
         assert remaining == "Let me check."
         assert len(tool_calls) == 1
@@ -385,7 +385,7 @@ class TestGemma4ChatTemplateParser:
         assert tool_calls[0].arguments == {"city": "SF", "count": 2}
 
     def test_tool_parser_drops_pending_tool_response_marker(self, parser):
-        response = "<|tool_call>call:get_weather{city:<|\"|>SF<|\"|>}<tool_call|><|tool_response>"
+        response = '<|tool_call>call:get_weather{city:<|"|>SF<|"|>}<tool_call|><|tool_response>'
         tool_calls, remaining = parser.tool_parser.parse(response)
         assert remaining == ""
         assert len(tool_calls) == 1
@@ -401,7 +401,7 @@ class TestGemma4ChatTemplateParser:
             }
         ]
         result = parser.parse(messages, add_generation_prompt=True)
-        assert result == "<bos><|turn>model\n<|tool_response>response:search{result:<|\"|>ok<|\"|>}<tool_response|>"
+        assert result == '<bos><|turn>model\n<|tool_response>response:search{result:<|"|>ok<|"|>}<tool_response|>'
 
     def test_text_content_parts_render_as_text(self, parser):
         messages = [
