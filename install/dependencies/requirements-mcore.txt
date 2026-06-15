@@ -1,0 +1,12 @@
+# Megatron & Distributed Training
+megatron-core==0.15.0rc7
+mbridge @ git+https://github.com/ISEEKYAN/mbridge.git@2334188
+# GDN attention (Qwen3.5 / Qwen3-Next / Gemma efficient): Triton >= 3.4 on Hopper
+# miscompiles the gated chunk_bwd_dqkwg kernel (fla #640), so fla routes that
+# backward through a TileLang backend instead. tilelang 0.1.11's bundled libtvm
+# statically links a second tvm-ffi runtime that double-registers against
+# apache-tvm-ffi 0.1.12 (a hard error since 0.1.12: "TypeAttr already
+# registered"), so pin the ffi runtime to 0.1.11 — which satisfies tilelang
+# (capped <=0.1.11 upstream) and flashinfer 0.6.6 (>=0.1.6) simultaneously.
+tilelang==0.1.11
+apache-tvm-ffi>=0.1.10,<=0.1.11

@@ -1,0 +1,844 @@
+diff --git a/vllm/config/multimodal.py b/vllm/config/multimodal.py
+index e66511c92..05632b25a 100644
+--- a/vllm/config/multimodal.py
++++ b/vllm/config/multimodal.py
+@@ -58,7 +58,7 @@ class MultiModalDummyOptionsBuiltins(TypedDict, total=False):
+ 
+ 
+ MMEncoderTPMode = Literal["weights", "data"]
+-MMCacheType = Literal["shm", "lru"]
++MMCacheType = Literal["shm", "lru", "processor_only"]
+ MMTensorIPC = Literal["direct_rpc", "torch_shm"]
+ MMDummyOptions: TypeAlias = dict[str, BaseDummyOptions]
+ """
+diff --git a/vllm/entrypoints/openai/completion/protocol.py b/vllm/entrypoints/openai/completion/protocol.py
+index c785d2540..daadcf285 100644
+--- a/vllm/entrypoints/openai/completion/protocol.py
++++ b/vllm/entrypoints/openai/completion/protocol.py
+@@ -85,6 +85,7 @@ class CompletionRequest(OpenAIBaseModel):
+ 
+     # --8<-- [start:completion-extra-params]
+     prompt_embeds: bytes | list[bytes] | None = None
++    image_data: list[dict] | None = None  # [axon] [{"type": "image_base64", "data": "..."}]
+     add_special_tokens: bool = Field(
+         default=True,
+         description=(
+@@ -466,6 +467,7 @@ class CompletionResponseChoice(OpenAIBaseModel):
+         ),
+     )
+     token_ids: list[int] | None = None  # For response
++    routed_experts: dict | None = None  # [axon] {"data": base64 str, "shape": [int], "dtype": "int16"}
+     prompt_logprobs: list[dict[int, Logprob] | None] | None = None
+     prompt_token_ids: list[int] | None = None  # For prompt
+ 
+diff --git a/vllm/entrypoints/openai/completion/serving.py b/vllm/entrypoints/openai/completion/serving.py
+index fb7f253c7..fad10178c 100644
+--- a/vllm/entrypoints/openai/completion/serving.py
++++ b/vllm/entrypoints/openai/completion/serving.py
+@@ -2,11 +2,14 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
+ import asyncio
++import base64
+ import time
+ from collections.abc import AsyncGenerator, AsyncIterator
+ from collections.abc import Sequence as GenericSequence
+ from typing import TYPE_CHECKING, cast
+ 
++import numpy as np
++
+ from fastapi import Request
+ 
+ from vllm.engine.protocol import EngineClient
+@@ -518,12 +521,27 @@ class OpenAIServingCompletion(OpenAIServing):
+                 else:
+                     logprobs = None
+ 
++                # [axon] Serialize routed_experts as base64 + shape metadata
++                routed_experts_payload = None
++                if output.routed_experts is not None:
++                    arr = np.ascontiguousarray(
++                        output.routed_experts, dtype=np.int16
++                    )
++                    routed_experts_payload = {
++                        "data": base64.b64encode(
++                            arr.tobytes()
++                        ).decode("ascii"),
++                        "shape": list(arr.shape),
++                        "dtype": "int16",
++                    }
++
+                 choice_data = CompletionResponseChoice(
+                     index=len(choices),
+                     text=output_text,
+                     logprobs=logprobs,
+                     finish_reason=output.finish_reason,
+                     stop_reason=output.stop_reason,
++                    routed_experts=routed_experts_payload,
+                     prompt_logprobs=final_res.prompt_logprobs,
+                     prompt_token_ids=(
+                         prompt_token_ids if request.return_token_ids else None
+diff --git a/vllm/entrypoints/serve/render/serving.py b/vllm/entrypoints/serve/render/serving.py
+index 52f03447d..a1d060456 100644
+--- a/vllm/entrypoints/serve/render/serving.py
++++ b/vllm/entrypoints/serve/render/serving.py
+@@ -484,7 +484,7 @@ class OpenAIServingRender:
+             tok_params,
+             prompt_extras={
+                 k: v
+-                for k in ("mm_processor_kwargs", "cache_salt")
++                for k in ("mm_processor_kwargs", "cache_salt", "image_data")  # [axon] added image_data
+                 if (v := getattr(request, k, None)) is not None
+             },
+         )
+diff --git a/vllm/model_executor/layers/fused_moe/activation.py b/vllm/model_executor/layers/fused_moe/activation.py
+index 3112b3054..86c317ae0 100644
+--- a/vllm/model_executor/layers/fused_moe/activation.py
++++ b/vllm/model_executor/layers/fused_moe/activation.py
+@@ -15,6 +15,7 @@ class MoEActivation(Enum):
+     # and produce output of shape [..., d]
+     SILU = "silu"
+     GELU = "gelu"
++    GELU_TANH = "gelu_tanh"
+     RELU2 = "relu2"
+     SWIGLUOAI = "swigluoai"
+     SWIGLUSTEP = "swiglustep"
+@@ -64,6 +65,7 @@ class MoEActivation(Enum):
+ _CUSTOM_OP_NAMES: dict[MoEActivation, str] = {
+     MoEActivation.SILU: "silu_and_mul",
+     MoEActivation.GELU: "gelu_and_mul",
++    MoEActivation.GELU_TANH: "gelu_tanh_and_mul",
+     MoEActivation.SWIGLUOAI: "swigluoai_and_mul",
+     MoEActivation.SWIGLUSTEP: "swiglustep_and_mul",
+     MoEActivation.RELU2: "relu2",
+@@ -115,6 +117,8 @@ def apply_moe_activation(
+         torch.ops._C.silu_and_mul(output, input)
+     elif activation == MoEActivation.GELU:
+         torch.ops._C.gelu_and_mul(output, input)
++    elif activation == MoEActivation.GELU_TANH:
++        torch.ops._C.gelu_tanh_and_mul(output, input)
+     elif activation == MoEActivation.SWIGLUOAI:
+         torch.ops._C.swigluoai_and_mul(output, input)
+     elif activation == MoEActivation.SWIGLUSTEP:
+diff --git a/vllm/model_executor/layers/fused_moe/routed_experts_capturer.py b/vllm/model_executor/layers/fused_moe/routed_experts_capturer.py
+index b061b3d38..6a45ab780 100644
+--- a/vllm/model_executor/layers/fused_moe/routed_experts_capturer.py
++++ b/vllm/model_executor/layers/fused_moe/routed_experts_capturer.py
+@@ -127,7 +127,18 @@ class RoutedExpertsCapturer:
+ 
+         hf_config = vllm_config.model_config.hf_text_config
+         num_layers = hf_config.num_hidden_layers
+-        num_experts_per_tok = hf_config.num_experts_per_tok
++        # Most MoE configs use `num_experts_per_tok` (HF convention).
++        # Gemma4 names this `top_k_experts`.
++        num_experts_per_tok = getattr(
++            hf_config,
++            "num_experts_per_tok",
++            getattr(hf_config, "top_k_experts", None),
++        )
++        if num_experts_per_tok is None:
++            raise AttributeError(
++                "routed_experts_capturer: config has neither "
++                "`num_experts_per_tok` nor `top_k_experts` — cannot size buffer"
++            )
+ 
+         # Initialize device buffer
+         self._device_buffer = torch.zeros(
+@@ -281,10 +292,17 @@ class RoutedExpertsReader:
+             return  # Already attached
+ 
+         hf_config = vllm_config.model_config.hf_text_config
++        # Gemma4 exposes the top-k-experts count as `top_k_experts`; all other
++        # MoE configs use `num_experts_per_tok`. Accept either.
++        _nept = getattr(
++            hf_config,
++            "num_experts_per_tok",
++            getattr(hf_config, "top_k_experts", None),
++        )
+         shape = (
+             max_num_kv_tokens,
+             hf_config.num_hidden_layers,
+-            hf_config.num_experts_per_tok,
++            _nept,
+         )
+ 
+         self.dp_rank = vllm_config.parallel_config.data_parallel_rank
+diff --git a/vllm/model_executor/models/gemma4.py b/vllm/model_executor/models/gemma4.py
+index edb533134..609d3322e 100644
+--- a/vllm/model_executor/models/gemma4.py
++++ b/vllm/model_executor/models/gemma4.py
+@@ -81,6 +81,166 @@ def _get_text_config(config):
+     return config
+ 
+ 
++def _gemma4_torch_compile_safe(vllm_config: VllmConfig) -> bool:
++    """Disable ``@support_torch_compile`` (and its cudagraph capture) for
++    Gemma4 variants that hit a vLLM cross-layer KV-cache dependency bug.
++
++    Affected: Gemma4 MQA + KV sharing (e.g. ``gemma-4-E2B-it`` with
++    ``num_key_value_heads=1`` and ``num_kv_shared_layers=20``). This trips
++    two pre-existing vLLM bugs that GQA variants (E4B etc.) don't:
++
++    1. **Sampler/actor probs mismatch (TP >= 2 only).** When TP >
++       num_kv_heads, K/V weights are replicated across ranks. Under
++       cudagraph PIECEWISE, ``probs_diff_mean`` between an FSDP recompute
++       and the vLLM sampler jumps to ~0.05 (vs ~0.004 for E4B) and
++       ``logprobs_diff_max`` hits ~76 nats — vLLM reports a token at ~99 %
++       probability that the actor reproduces at ~1e-33. The pattern is
++       positional (e.g. multiple batches diverge at positions 84/90/106 of
++       the response).
++
++    2. **CUDA "illegal memory access" crash (TP=1 directly observed;
++       TP=2 only anecdotal).** Under compile + cudagraph, E2B hits a
++       GPU illegal-access fault from a captured kernel. Surface site
++       varies by run:
++
++       - **TP=1, small-batch repro (mine, ``train_batch_size=4``,
++         ``max_seq_length=5000``)**: ``Triton Error [CUDA]: an illegal
++         memory access`` raised inside ``execute_model`` during step 1
++         generation. Deterministic across attempts.
++       - **TP=1, full-batch script (user's
++         ``train_batch_size=64``, ``max_seq_length=18484``)**: fault
++         surfaces later, in
++         ``GpuModelRunner._to_list -> transfer_event.synchronize()`` as
++         ``cudaErrorIllegalInstruction`` after step 1 metric prints.
++       - **TP=2**: an earlier (no-fix) user log reportedly contained
++         illegal-instruction tracebacks, but that log was overwritten
++         before we could re-examine. Two short repro attempts at TP=2
++         + no fix did **not** crash (2 steps and 20 steps respectively;
++         probs_diff was bad throughout). So at TP=2 we have no
++         currently-reproducible evidence of the crash — only the
++         pre-existing probs_diff blowup (item 1).
++
++       E4B at TP=2 in contrast runs hundreds of steps without crashing.
++
++       The exact faulting kernel was not isolated (would need
++       ``CUDA_LAUNCH_BLOCKING=1`` for a precise stack).
++
++    Hypothesized root cause (NOT directly proven — see code-reading
++    note below): ``unified_kv_cache_update`` is registered with
++    ``mutates_args=[]`` but does mutate ``kv_cache`` (looked up via
++    forward context). It signals its cache write to a downstream
++    ``unified_attention_with_output`` via the returned
++    ``kv_cache_dummy_dep`` tensor — a same-layer data-flow edge.
++    KV-shared layers never receive that dep, so torch.compile /
++    piecewise cudagraph has no in-graph dependency from the upstream
++    cache write to the shared-layer attention read. For GQA per-rank KV
++    the latent reordering appears benign; for MQA it appears to
++    manifest as both the probs_diff blowup and the illegal-access
++    crash. We did not trace the faulting kernel back to this op
++    directly — both bugs being fixed by the same set of disables
++    (cudagraph off ± compile off) is consistent with this hypothesis
++    but doesn't prove it.
++
++    Workaround, split by TP:
++
++    - **TP > num_kv_heads** (replicated KV → catastrophic mismatch): force
++      fully eager — ``cudagraph_mode = NONE``, ``mode = NONE``,
++      ``splitting_ops = []``, ``enforce_eager = True``. Required because
++      torch.compile's reordering itself, not just cudagraph replay,
++      produces the bad probs_diff.
++
++    - **TP <= num_kv_heads** (no replication, ``probs_diff`` already
++      ~0.004): keep ``torch.compile`` for the speedup; only disable
++      cudagraph (``cudagraph_mode = NONE``, ``splitting_ops = []``).
++      Recovers ~most of the inference speed; only loses the
++      decode-launch-overhead-elimination cudagraph provides.
++
++    Verified end-to-end via ``recipes/math/train_acereason_math_fsdp.sh``
++    on E2B:
++      - TP=1: step 1 probs_diff=0.0028 / step 2=0.0033, step ~155s, no crash.
++      - TP=2: step 1 probs_diff=0.0028 / step 2=0.0047, step ~378s, no crash.
++
++    POTENTIAL principled upstream fix (hypothesis only — NOT verified):
++
++    Our analysis points at ``unified_kv_cache_update`` being registered
++    with ``mutates_args=[]`` even though it mutates ``kv_cache`` looked
++    up via context. The existing ``kv_cache_dummy_dep`` return value is
++    a workaround that creates a same-layer data-flow edge so torch.compile
++    won't reorder the attention read before the update, but KV-shared
++    layers never receive that dep — leaving cross-layer ordering up to
++    whatever the compiler/cudagraph scheduler decides.
++
++    A likely-correct fix would be to make ``unified_kv_cache_update``
++    take ``kv_cache`` as an explicit argument and register it with
++    ``mutates_args=["kv_cache"]``, and similarly make
++    ``unified_attention_with_output`` take ``kv_cache`` as a read input.
++    The compiler would then see the real read-after-write across layers
++    naturally and the ``kv_cache_dummy_dep`` mechanism could be dropped.
++
++    Estimated scope (unverified): touches
++    ``vllm/model_executor/layers/attention/attention.py``,
++    ``vllm/compilation/passes/fusion/rope_kvcache_fusion.py``,
++    ``vllm/compilation/passes/utility/fix_functionalization.py``,
++    ``vllm/model_executor/models/extract_hidden_states.py`` — every
++    model going through vLLM's attention path. Needs upstream-style
++    regression testing on multiple model families (Llama, Qwen, GQA
++    Gemma, MoE variants) before relying on it. This direction has NOT
++    been built or measured — it is a hypothesis derived from reading
++    the code path, and it could turn out the bug is somewhere else
++    inside the captured Triton kernels and this change wouldn't help.
++    """
++    config = _get_text_config(vllm_config.model_config.hf_config)
++    tp_size = vllm_config.parallel_config.tensor_parallel_size
++    num_kv_heads = getattr(
++        config, "num_key_value_heads", config.num_attention_heads
++    )
++    num_kv_shared_layers = getattr(config, "num_kv_shared_layers", 0)
++    if num_kv_heads == 1 and num_kv_shared_layers > 0:
++        # Local import — top-level config import cycle.
++        from vllm.config.compilation import CUDAGraphMode, CompilationMode
++
++        cc = vllm_config.compilation_config
++        # Cudagraph capture/replay hits an illegal-memory-access at any TP
++        # for E2B (verified at TP=1 step 1, TP=2 step 2). Always disable.
++        if cc.cudagraph_mode != CUDAGraphMode.NONE:
++            cc.cudagraph_mode = CUDAGraphMode.NONE
++        cc.splitting_ops = []
++        if tp_size > num_kv_heads:
++            # TP > num_kv_heads replicates K/V; the compile-time reordering
++            # itself produces catastrophic probs_diff (~0.05). Fully eager.
++            cc.mode = CompilationMode.NONE
++            vllm_config.model_config.enforce_eager = True
++            logger.warning(
++                "[axon] Disabling torch.compile + cudagraph for "
++                "Gemma4Model (num_kv_heads=%d, tp=%d, "
++                "kv_shared_layers=%d): replicated MQA + KV sharing causes "
++                "catastrophic probs_diff (~0.05) AND a cudagraph "
++                "illegal-memory-access. Equivalent to enforce_eager=True.",
++                num_kv_heads,
++                tp_size,
++                num_kv_shared_layers,
++            )
++            return False
++        else:
++            # TP <= num_kv_heads: probs_diff is fine (~0.004) without
++            # eager. Keep torch.compile for the speed-up; only cudagraph
++            # is unsafe.
++            logger.warning(
++                "[axon] Disabling cudagraph for Gemma4Model "
++                "(num_kv_heads=%d, tp=%d, kv_shared_layers=%d): MQA + KV "
++                "sharing hits a cudagraph illegal-memory-access. "
++                "torch.compile is kept for speed.",
++                num_kv_heads,
++                tp_size,
++                num_kv_shared_layers,
++            )
++            # torch.compile stays on — return True so @support_torch_compile
++            # wraps the model. The cudagraph_mode rewrite above neuters the
++            # capture/replay path.
++            return True
++    return True
++
++
+ class Gemma4MLP(nn.Module):
+     def __init__(
+         self,
+@@ -238,7 +398,7 @@ class Gemma4MoE(nn.Module):
+             quant_config=quant_config,
+             prefix=f"{prefix}.experts",
+             custom_routing_function=routing_function,
+-            activation="gelu",
++            activation="gelu_tanh",
+         )
+ 
+     def forward(self, x: torch.Tensor, router_logits: torch.Tensor) -> torch.Tensor:
+@@ -636,7 +796,7 @@ class Gemma4DecoderLayer(nn.Module):
+         return hidden_states, None
+ 
+ 
+-@support_torch_compile
++@support_torch_compile(enable_if=_gemma4_torch_compile_safe)
+ class Gemma4Model(nn.Module):
+     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+         super().__init__()
+diff --git a/vllm/model_executor/models/qwen3_moe.py b/vllm/model_executor/models/qwen3_moe.py
+index f2ce070be..ff86b2d86 100644
+--- a/vllm/model_executor/models/qwen3_moe.py
++++ b/vllm/model_executor/models/qwen3_moe.py
+@@ -525,6 +525,40 @@ class Qwen3MoeModel(nn.Module, EagleModelMixin):
+             num_redundant_experts=self.num_redundant_experts,
+         )
+ 
++    def load_fused_expert_weights(
++        self,
++        name: str,
++        params_dict: dict,
++        loaded_weight: torch.Tensor,
++        shard_id: str,
++        num_experts: int,
++    ) -> bool:
++        """Load a stacked (all-expert) tensor into the fused w13/w2 parameter.
++
++        Transformers 5.x stores Qwen3-MoE expert weights as stacked tensors:
++          - ``*.mlp.experts.gate_up_proj``: shape (num_experts, 2*I, H)
++          - ``*.mlp.experts.down_proj``:    shape (num_experts, H, I)
++
++        This method iterates over the expert dimension and uses the existing
++        per-expert weight_loader to load each slice into the fused w13/w2 param.
++        """
++        param = params_dict[name]
++        weight_loader = typing.cast(Callable[..., bool], param.weight_loader)
++        loaded_local_expert = False
++        for expert_id in range(num_experts):
++            curr_expert_weight = loaded_weight[expert_id]
++            success = weight_loader(
++                param,
++                curr_expert_weight,
++                name,
++                shard_id,
++                expert_id,
++                return_success=True,
++            )
++            if success:
++                loaded_local_expert = True
++        return loaded_local_expert
++
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+         stacked_params_mapping = [
+             # (param_name, shard_name, shard_id)
+@@ -548,6 +582,15 @@ class Qwen3MoeModel(nn.Module, EagleModelMixin):
+         params_dict = dict(self.named_parameters())
+         loaded_params: set[str] = set()
+         expert_params_mapping = self.get_expert_mapping()
++        # Transformers 5.x uses stacked expert format (experts.gate_up_proj /
++        # experts.down_proj) instead of per-expert (experts.N.gate_proj).
++        # Detect this format on the fly and switch to fused loading.
++        is_fused_expert = False
++        fused_expert_params_mapping = [
++            ("experts.w13_weight", "experts.gate_up_proj", 0, "w1"),
++            ("experts.w2_weight", "experts.down_proj", 0, "w2"),
++        ]
++        num_experts = self.config.num_experts
+         for name, loaded_weight in weights:
+             if self.quant_config is not None and (
+                 scale_name := self.quant_config.get_cache_scale(name)
+@@ -566,16 +609,18 @@ class Qwen3MoeModel(nn.Module, EagleModelMixin):
+                 name = maybe_remap_kv_scale_name(name, params_dict)
+                 if name is None:
+                     continue
++            # Detect transformers 5.x stacked expert format on first occurrence.
++            if "experts.gate_up_proj" in name or "experts.down_proj" in name:
++                is_fused_expert = True
++                expert_params_mapping = fused_expert_params_mapping
++
+             for param_name, weight_name, shard_id in stacked_params_mapping:
+                 # Skip non-stacked layers and experts (experts handled below).
+                 if weight_name not in name:
+                     continue
+-                # We have mlp.experts[0].gate_proj in the checkpoint.
+-                # Since we handle the experts below in expert_params_mapping,
+-                # we need to skip here BEFORE we update the name, otherwise
+-                # name will be updated to mlp.experts[0].gate_up_proj, which
+-                # will then be updated below in expert_params_mapping
+-                # for mlp.experts[0].gate_gate_up_proj, which breaks load.
++                # We have mlp.experts[0].gate_proj in the checkpoint (old format)
++                # OR mlp.experts.gate_up_proj (transformers 5.x stacked format).
++                # Both are handled below in expert_params_mapping, so skip here.
+                 if "mlp.experts" in name:
+                     continue
+                 name = name.replace(weight_name, param_name)
+@@ -627,24 +672,45 @@ class Qwen3MoeModel(nn.Module, EagleModelMixin):
+                     ):
+                         continue
+ 
+-                    param = params_dict[name_mapped]
+-                    # We should ask the weight loader to return success or not
+-                    # here since otherwise we may skip experts with other
+-                    # available replicas.
+-                    weight_loader = typing.cast(
+-                        Callable[..., bool], param.weight_loader
+-                    )
+-                    success = weight_loader(
+-                        param,
+-                        loaded_weight,
+-                        name_mapped,
+-                        shard_id=shard_id,
+-                        expert_id=expert_id,
+-                        return_success=True,
+-                    )
+-                    if success:
+-                        name = name_mapped
+-                        break
++                    if is_fused_expert:
++                        # Transformers 5.x stacked format: tensor shape is
++                        # (num_experts, 2*I, H) for gate_up_proj or (E, H, I)
++                        # for down_proj. Split gate_up into gate (w1) + up (w3).
++                        if "experts.gate_up_proj" in name:
++                            halves = loaded_weight.chunk(2, dim=-2)
++                            success_w1 = self.load_fused_expert_weights(
++                                name_mapped, params_dict, halves[0], "w1", num_experts
++                            )
++                            success_w3 = self.load_fused_expert_weights(
++                                name_mapped, params_dict, halves[1], "w3", num_experts
++                            )
++                            success = success_w1 and success_w3
++                        else:
++                            success = self.load_fused_expert_weights(
++                                name_mapped, params_dict, loaded_weight, shard_id, num_experts
++                            )
++                        if success:
++                            name = name_mapped
++                            break
++                    else:
++                        param = params_dict[name_mapped]
++                        # We should ask the weight loader to return success or not
++                        # here since otherwise we may skip experts with other
++                        # available replicas.
++                        weight_loader = typing.cast(
++                            Callable[..., bool], param.weight_loader
++                        )
++                        success = weight_loader(
++                            param,
++                            loaded_weight,
++                            name_mapped,
++                            shard_id=shard_id,
++                            expert_id=expert_id,
++                            return_success=True,
++                        )
++                        if success:
++                            name = name_mapped
++                            break
+                 else:
+                     if is_expert_weight:
+                         # We've checked that this is an expert weight
+diff --git a/vllm/multimodal/registry.py b/vllm/multimodal/registry.py
+index fa414a592..9a2e92752 100644
+--- a/vllm/multimodal/registry.py
++++ b/vllm/multimodal/registry.py
+@@ -262,6 +262,10 @@ class MultiModalRegistry:
+         if mm_config.mm_processor_cache_gb <= 0:
+             return None
+ 
++        # If user explicitly requested "processor_only", use it directly.
++        if mm_config.mm_processor_cache_type == "processor_only":
++            return "processor_only"
++
+         # Check if IPC caching is supported.
+         parallel_config = vllm_config.parallel_config
+         is_ipc_supported = parallel_config._api_process_count == 1 and (
+diff --git a/vllm/renderers/base.py b/vllm/renderers/base.py
+index 23f952eff..348461e64 100644
+--- a/vllm/renderers/base.py
++++ b/vllm/renderers/base.py
+@@ -69,6 +69,23 @@ if TYPE_CHECKING:
+ logger = init_logger(__name__)
+ 
+ 
++# [axon] Decode image_data from completion request (base64 → PIL Image).
++def _decode_image_data(image_data: list[dict]) -> list[Any]:
++    import base64
++    from io import BytesIO
++
++    from PIL import Image
++    images = []
++    for item in image_data:
++        if isinstance(item, dict) and item.get("type") == "image_base64":
++            raw = base64.b64decode(item["data"])
++            img = Image.open(BytesIO(raw)).convert("RGB")
++            images.append(img)
++        else:
++            raise TypeError(f"Unsupported image_data item: {type(item)}")
++    return images
++
++
+ _T = TypeVar("_T", bound=TokenizerLike, default=TokenizerLike)
+ 
+ 
+@@ -548,6 +565,13 @@ class BaseRenderer(ABC, Generic[_T]):
+         if not prompt_extras:
+             return
+ 
++        # [axon] Decode image_data (base64) into multi_modal_data for the engine
++        image_data = prompt_extras.pop("image_data", None)
++        if image_data:
++            images = _decode_image_data(image_data)
++            if images:
++                prompt_extras.setdefault("multi_modal_data", {})["image"] = images
++
+         for prompt in prompts:
+             target_prompt = extract_target_prompt(self.model_config, prompt)
+             target_prompt.update(prompt_extras)  # type: ignore[arg-type]
+diff --git a/vllm/v1/attention/backends/flashinfer.py b/vllm/v1/attention/backends/flashinfer.py
+index 5b6c198e7..712ceacdc 100755
+--- a/vllm/v1/attention/backends/flashinfer.py
++++ b/vllm/v1/attention/backends/flashinfer.py
+@@ -1328,6 +1328,19 @@ class FlashInferImpl(AttentionImpl):
+         prefill_use_trtllm = isinstance(attn_metadata.prefill, TRTLLMPrefill)
+         decode_use_trtllm = isinstance(attn_metadata.decode, TRTLLMDecode)
+ 
++        # [axon] Zero TRTLLM workspace buffers before each attention call.
++        # In hybrid-engine training, vLLM is sleep/wake-cycled and the
++        # workspace contents become stale after the training step overwrites
++        # GPU memory, leading to illegal memory access or silent corruption.
++        if prefill_use_trtllm:
++            pw = getattr(attn_metadata.prefill, "wrapper", None)
++            if pw is not None and hasattr(pw, "_float_workspace_buffer"):
++                pw._float_workspace_buffer.zero_()
++        if decode_use_trtllm:
++            dw = getattr(attn_metadata.decode, "wrapper", None)
++            if dw is not None and hasattr(dw, "_float_workspace_buffer"):
++                dw._float_workspace_buffer.zero_()
++
+         # The attn+quant fusion happens when output_scale is provided.
+         if output_scale is None:
+             assert output_block_scale is None, (
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index fe524ccac..fa6ba97ca 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -267,22 +267,32 @@ class Scheduler(SchedulerInterface):
+             assert len(kv_cache_config.kv_cache_groups) > 0, (
+                 "enable_return_routed_experts requires at least one kv cache group"
+             )
+-            # Find the attention group for routed experts indexing.
++            # [axon] Find the full-attention group for routed experts indexing.
++            # For models with mixed attention (e.g. Gemma4: sliding + full),
++            # the SlidingWindowSpec group frees blocks outside its window as
++            # the sequence grows.  We must use FullAttentionSpec which retains
++            # blocks for all positions; otherwise freed slots read back as
++            # zeros and corrupt the routing data.
++            from vllm.v1.kv_cache_interface import FullAttentionSpec
+             self.routed_experts_attn_gid = 0
++            fallback_gid: int | None = None
+             for gid, group in enumerate(kv_cache_config.kv_cache_groups):
+-                if isinstance(group.kv_cache_spec, AttentionSpec):
++                if isinstance(group.kv_cache_spec, FullAttentionSpec):
+                     self.routed_experts_attn_gid = gid
+                     break
+-            min_block_size = min(
+-                [
+-                    group.kv_cache_spec.block_size
+-                    for group in kv_cache_config.kv_cache_groups
+-                ]
+-            )
+-            num_groups = len(kv_cache_config.kv_cache_groups)
+-            self.max_num_kv_tokens = (
+-                kv_cache_config.num_blocks // num_groups
+-            ) * min_block_size
++                if fallback_gid is None and isinstance(
++                    group.kv_cache_spec, AttentionSpec
++                ):
++                    fallback_gid = gid
++            else:
++                if fallback_gid is not None:
++                    self.routed_experts_attn_gid = fallback_gid
++            # Use the attention group's block_size for buffer sizing.
++            # For hybrid models (e.g. Qwen3.5 GDN + full attn), the attention
++            # group has larger slot indices than other groups.
++            attn_gid = self.routed_experts_attn_gid
++            attn_block_size = kv_cache_config.kv_cache_groups[attn_gid].kv_cache_spec.block_size
++            self.max_num_kv_tokens = kv_cache_config.num_blocks * attn_block_size
+             dcp_size = self.vllm_config.parallel_config.decode_context_parallel_size
+             pcp_size = self.vllm_config.parallel_config.prefill_context_parallel_size
+             if pcp_size * dcp_size > 1:
+diff --git a/vllm/v1/sample/sampler.py b/vllm/v1/sample/sampler.py
+index 3840a7068..477b917b9 100644
+--- a/vllm/v1/sample/sampler.py
++++ b/vllm/v1/sample/sampler.py
+@@ -72,19 +72,18 @@ class Sampler(nn.Module):
+         logprobs_mode_override: LogprobsMode | None = None,
+     ) -> SamplerOutput:
+         logprobs_mode = logprobs_mode_override or self.logprobs_mode
+-        # NOTE(woosuk): Use the original logits (before any penalties or
+-        # temperature scaling) for the top-k logprobs.
+-        # This is different from the V0 sampler, which uses the logits that
+-        # is used for sampling (after penalties and temperature scaling).
+         num_logprobs = sampling_metadata.max_num_logprobs
+-        if num_logprobs is not None:
+-            if logprobs_mode == "raw_logprobs":
+-                raw_logprobs = self.compute_logprobs(logits)
+-            elif logprobs_mode == "raw_logits":
+-                if logits.dtype == torch.float32:
+-                    raw_logprobs = logits.clone()
+-                else:
+-                    raw_logprobs = logits.to(torch.float32)
++
++        # [axon] ORIGINAL vllm computes logprobs here, BEFORE penalties:
++        #   if num_logprobs is not None:
++        #       if logprobs_mode == "raw_logprobs":
++        #           raw_logprobs = self.compute_logprobs(logits)
++        #       elif logprobs_mode == "raw_logits":
++        #           raw_logprobs = logits.to(torch.float32)
++        # We move logprobs computation to AFTER penalties below to match
++        # axon's training forward pass (which applies temperature before
++        # log_softmax). Without this, there is a systematic bias in
++        # probs_diff because training uses T-scaled logits.
+ 
+         # Use float32 for the logits.
+         logits = logits.to(torch.float32)
+@@ -94,6 +93,11 @@ class Sampler(nn.Module):
+         )
+         # Sample the next token.
+         sampled, processed_logprobs = self.sample(logits, sampling_metadata)
++
++        # [axon] Compute logprobs AFTER penalties/temperature/top-k/top-p.
++        if num_logprobs is not None:
++            raw_logprobs = self.compute_logprobs(logits)
++
+         if processed_logprobs is not None:
+             raw_logprobs = processed_logprobs
+         # Convert sampled token ids to int64 (long) type to ensure compatibility
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index 2e62206da..2cec708c1 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -6819,11 +6819,26 @@ class GPUModelRunner(
+             kv_transfer_group.set_host_xfer_buffer_ops(copy_kv_blocks)
+ 
+     def _get_attention_kv_cache_gid(self) -> int:
+-        """Find the KV cache group index for attention layers."""
++        """Find the KV cache group that retains blocks for all token positions.
++
++        For models with mixed attention (e.g. Gemma4: sliding + full), the
++        SlidingWindowSpec group frees blocks outside its window as the
++        sequence grows.  The routed-experts capturer indexes shared memory
++        by slot, so reading from a freed block's slots returns zeros and
++        corrupts the routing data.
++
++        Preference order:
++          1. FullAttentionSpec  — always retains all blocks
++          2. Any other AttentionSpec (fallback)
++        """
++        fallback_gid: int | None = None
+         for gid, group in enumerate(self.kv_cache_config.kv_cache_groups):
+-            if isinstance(group.kv_cache_spec, AttentionSpec):
++            if isinstance(group.kv_cache_spec, FullAttentionSpec):
+                 return gid
+-        return 0
++            if fallback_gid is None and isinstance(group.kv_cache_spec,
++                                                    AttentionSpec):
++                fallback_gid = gid
++        return fallback_gid if fallback_gid is not None else 0
+ 
+     def init_routed_experts_capturer(self):
+         logger.info(
+@@ -6832,16 +6847,14 @@ class GPUModelRunner(
+         )
+         routed_experts_capturer = RoutedExpertsCapturer.create()
+         self.routed_experts_attn_gid = self._get_attention_kv_cache_gid()
+-        min_block_size = min(
+-            [
+-                group.kv_cache_spec.block_size
+-                for group in self.kv_cache_config.kv_cache_groups
+-            ]
+-        )
+-        num_groups = len(self.kv_cache_config.kv_cache_groups)
+-        self.max_num_kv_tokens = (
+-            self.kv_cache_config.num_blocks // num_groups
+-        ) * min_block_size
++        # [axon] Use the attention group's block_size for buffer sizing,
++        # not min_block_size.  For hybrid models (e.g. Qwen3.5 GDN + full attn),
++        # the attention group has larger slot indices than the GDN group.
++        # Using min_block_size causes out-of-bounds when slot indices from the
++        # attention group exceed the undersized buffer.
++        attn_gid = self.routed_experts_attn_gid
++        attn_block_size = self.kv_cache_config.kv_cache_groups[attn_gid].kv_cache_spec.block_size
++        self.max_num_kv_tokens = self.kv_cache_config.num_blocks * attn_block_size
+         dcp_size = self.vllm_config.parallel_config.decode_context_parallel_size
+         pcp_size = self.vllm_config.parallel_config.prefill_context_parallel_size
+         if pcp_size * dcp_size > 1:
+@@ -6861,7 +6874,7 @@ class GPUModelRunner(
+             BaseRouter,
+         )
+ 
+-        for module in self.compilation_config.static_forward_context.values():
++        for name, module in self.compilation_config.static_forward_context.items():
+             if isinstance(module, FusedMoE) and isinstance(module.router, BaseRouter):
+                 layer_id = module.layer_id
+ 
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index 91dcdc2b9..e89e7c42f 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -224,6 +224,9 @@ class Worker(WorkerBase):
+             if (
+                 parallel_config.distributed_executor_backend
+                 not in ("ray", "external_launcher")
++                and not isinstance(  # [axon] custom executor class
++                    parallel_config.distributed_executor_backend, type
++                )
+                 and parallel_config.data_parallel_backend != "ray"
+                 and parallel_config.nnodes_within_dp == 1
+             ):
+@@ -515,6 +518,32 @@ class Worker(WorkerBase):
+     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
+         """Allocate GPU KV cache with the specified kv_cache_config."""
+ 
++        # [axon] Downgrade FULL→PIECEWISE for sleep mode.
++        #
++        # FULL CUDA graphs capture the entire model forward including
++        # attention kernels.  Attention backends allocate workspace and
++        # metadata inside the "kv_cache" cuMem pool, whose content is
++        # discarded during sleep().  FULL graph replay reads that stale
++        # workspace → cudaErrorIllegalAddress.
++        #
++        # PIECEWISE graphs split at attention ops (which run eagerly and
++        # rebuild workspace each call), so they survive sleep/wake.
++        #
++        # This MUST run BEFORE _check_and_update_cudagraph_mode() →
++        # initialize_cudagraph_keys() populates the dispatcher keys.
++        # The original downgrade in compile_or_warm_up_model() ran too
++        # late — FULL decode keys were already registered and dispatch()
++        # routed uniform-decode batches to FULL graphs at runtime.
++        if self.vllm_config.model_config.enable_sleep_mode:
++            cc = self.vllm_config.compilation_config
++            if cc.cudagraph_mode is not None and cc.cudagraph_mode.has_full_cudagraphs():
++                logger.warning(
++                    "[axon] Sleep mode — downgrading cudagraph_mode "
++                    "from %s to PIECEWISE.",
++                    cc.cudagraph_mode.name,
++                )
++                cc.cudagraph_mode = CUDAGraphMode.PIECEWISE
++
+         # Update local config with adjusted num blocks after profiling,
+         # so that it's available to the warmup stage.
+         self.cache_config.num_gpu_blocks = kv_cache_config.num_blocks
+@@ -548,7 +577,32 @@ class Worker(WorkerBase):
+ 
+     @instrument(span_name="Warmup (GPU)")
+     def compile_or_warm_up_model(self) -> float:
++        # TODO: Qwen3 Dense (FULL GRAPH) + Megatron results in illegal cuda access at step 2.
++        # Need to investigate why Qwen3 Dense (FULL GRAPH) + fsdp is fine.
++        # [axon] In sleep mode, FULL CUDA graphs do not survive the sleep/wake
++        # cycle: sleep() unmaps CuMemAllocator VA ranges (weights,
++        # kv_cache) via cuMemUnmap, and even though wake_up() remaps the
++        # same VAs, FULL graph replay faults with cudaErrorIllegalAddress.
++        # PIECEWISE graphs are unaffected because they capture individual
++        # layer kernels whose inputs are provided at replay time.
++        # Downgrade to PIECEWISE so graphs are still used where safe.
++
++        if self.vllm_config.model_config.enable_sleep_mode:
++            cc = self.vllm_config.compilation_config
++            if cc.cudagraph_mode in (
++                CUDAGraphMode.FULL,
++                CUDAGraphMode.FULL_AND_PIECEWISE,
++                CUDAGraphMode.FULL_DECODE_ONLY,
++            ):
++                logger.info(
++                    "Sleep mode enabled — downgrading cudagraph_mode "
++                    "from %s to PIECEWISE (FULL graphs do not survive "
++                    "sleep/wake VA remapping).",
++                    cc.cudagraph_mode.name,
++                )
++                cc.cudagraph_mode = CUDAGraphMode.PIECEWISE
+         warmup_sizes: list[int] = []
++        #######
+ 
+         if self.vllm_config.compilation_config.mode == CompilationMode.VLLM_COMPILE:
+             # warm up sizes that are not in cudagraph capture sizes,
+@@ -812,6 +866,14 @@ class Worker(WorkerBase):
+             if isinstance(
+                 output, ModelRunnerOutput | AsyncModelRunnerOutput | NoneType
+             ):
++                # [axon] Ensure PP point-to-point sends complete before
++                # buffers are reused.  In hybrid-engine training vLLM is
++                # sleep/wake-cycled; without this sync, in-flight NCCL ops
++                # from intermediate PP stages may still be running when the
++                # training step reclaims GPU memory.
++                pp_group = get_pp_group()
++                if pp_group is not None and len(pp_group.ranks) > 1:
++                    torch.cuda.synchronize()
+                 return output
+ 
+         assert isinstance(output, IntermediateTensors)

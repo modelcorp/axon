@@ -1,0 +1,57 @@
+name: Security Checks
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - v0.*
+
+jobs:
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install security tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install bandit pip-audit
+
+      - name: Bandit (static security analysis)
+        run: |
+          bandit -r axon \
+            -x "checkpoints,outputs,logs,data,tests,axon/utils/rewards/code_utils" \
+            -ll
+
+      - name: pip-audit (dependency vulnerability scan)
+        run: |
+          set -euo pipefail
+          # text-generation CVE is transitive via browsergym/web-arena tooling.
+          PIP_AUDIT_IGNORE=(--ignore-vuln CVE-2024-3924 --ignore-vuln CVE-2026-0994)
+          base_requirements=(
+            install/dependencies/requirements-base.txt
+            install/dependencies/requirements-dev.txt
+            install/dependencies/requirements-docs.txt
+          )
+          base_args=()
+          for req in "${base_requirements[@]}"; do
+            base_args+=(-r "${req}")
+          done
+          # Base dependencies must resolve together.
+          pip-audit "${base_args[@]}" --progress-spinner off "${PIP_AUDIT_IGNORE[@]}"
+
+          # vLLM and SGLang are mutually exclusive; audit them separately.
+          vllm_args=("${base_args[@]}" -r install/dependencies/requirements-vllm.txt)
+          pip-audit "${vllm_args[@]}" --progress-spinner off "${PIP_AUDIT_IGNORE[@]}"
+
+          sglang_args=("${base_args[@]}" -r install/dependencies/requirements-sglang.txt)
+          pip-audit "${sglang_args[@]}" --progress-spinner off "${PIP_AUDIT_IGNORE[@]}"
+
+          # Megatron-core is an optional extra and is audited separately.
+          pip-audit -r install/dependencies/requirements-mcore.txt --progress-spinner off "${PIP_AUDIT_IGNORE[@]}"

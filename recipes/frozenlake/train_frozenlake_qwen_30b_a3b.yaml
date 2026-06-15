@@ -1,0 +1,183 @@
+# ===========================================================================
+# FrozenLake Agent — Qwen3-30B-A3B (MoE) on Megatron
+# ===========================================================================
+# Equivalent of train_frozenlake_qwen_30b_a3b.sh with:
+#   LOSS_MODE=ppo  ALL_OFFLOAD=True  STEP_MODE=False
+#
+# Usage:
+#   axon train \
+#       -c recipes/frozenlake/train_frozenlake_qwen_30b_a3b.yaml --dry-run
+#
+# ===========================================================================
+
+
+# ── Model & data ──────────────────────────────────────────────────────────
+
+model_path: Qwen/Qwen3-30B-A3B
+train_files: data/frozenlake/train.parquet
+val_files: data/frozenlake/test.parquet
+output_dir: axon-runs/
+
+# ── Logging ───────────────────────────────────────────────────────────────
+
+logger: [console, wandb]
+project_name: frozenlake-agent
+experiment_name: Qwen3-30B-A3B-frozenlake_agent-grpo-megatron
+
+
+# ── Cluster ───────────────────────────────────────────────────────────────
+
+num_gpus_per_node: 8
+num_nodes: 1
+
+
+# ── Decoding ──────────────────────────────────────────────────────────────
+
+decoding:
+  temperature: 0.7
+  n: 8
+
+
+# ── Validation ────────────────────────────────────────────────────────────
+
+validation:
+  before_train: false
+  steps: 10
+  decoding:
+    n: 4
+    temperature: 0.7
+    top_p: 0.8
+  
+
+# ── Training loop ─────────────────────────────────────────────────────────
+
+strategy: megatron
+hybrid_engine: true
+advantage: rloo
+train_batch_size: 64
+mini_batch_size: 64
+max_prompt_length: 2048
+max_seq_length: 4096
+max_steps: 10
+total_epochs: 10000
+save_steps: 10000
+moe_replay: true
+
+
+# ── Agent program (FrozenLake) ────────────────────────────────────────────
+
+program:
+  name: react
+  env_name: "recipes/frozenlake/env.py:FrozenLakeEnv"
+  env_args:
+    max_steps: 8
+  agent_name: "recipes/frozenlake/agent.py:FrozenLakeAgent"
+  agent_args:
+    use_multistep_prompt: true     # STEP_MODE=False → multistep on
+  max_steps: 10
+  accumulate_history: true         # STEP_MODE=False → cumulative context
+  accumulate_thinking: true
+
+
+# ── Loss (PPO) ────────────────────────────────────────────────────────────
+
+loss: ppo
+loss_args:
+  clip_ratio_low: 0.2
+  clip_ratio_high: 0.28
+  token_reduce: mean-norm
+  batch_reduce: step-mean
+  kl_coef: 0.0
+  kl_type: low_var_kl
+  entropy_coef: 0
+
+# ── Actor ─────────────────────────────────────────────────────────────────
+
+actor:
+  # Batching
+  use_dynamic_bsz: true
+  max_token_len_per_gpu: 32768
+  forward_use_dynamic_bsz: true
+  forward_max_token_len_per_gpu: 32768
+
+  # Optimizer
+  optimizer_args:
+    lr: 1.0e-6
+    weight_decay: 0.01
+    override_optimizer_args:
+      optimizer_offload_fraction: 1.0
+      overlap_cpu_optimizer_d2h_h2d: true
+      optimizer_cpu_offload: true
+      use_precision_aware_optimizer: true
+  lr_scheduler_args:
+    lr_warmup_steps: 0
+  grad_clip: 1.0
+
+  # Offloading
+  param_offload: true
+  optimizer_offload: true
+
+  # Kernels
+  use_fused_kernels: true
+
+  # Megatron parallelism & config
+  megatron:
+    use_mbridge: true
+    use_dist_checkpointing: false
+    grad_offload: true
+
+    # Parallelism (tuned for 30B MoE on 8 GPUs)
+    pipeline_model_parallel_size: 2
+    virtual_pipeline_model_parallel_size: null
+    tensor_model_parallel_size: 4
+    expert_model_parallel_size: 4
+    expert_tensor_parallel_size: 1
+    context_parallel_size: 1
+
+    # Transformer kernel fusions & recompute
+    override_transformer_config:
+      # Fusions
+      attention_softmax_in_fp32: true
+      bias_activation_fusion: true
+      masked_softmax_fusion: true
+      bias_dropout_fusion: true
+      apply_rope_fusion: true
+      gradient_accumulation_fusion: true
+      cross_entropy_loss_fusion: true
+      persist_layer_norm: true
+      memory_efficient_layer_norm: false
+
+      # MoE
+      moe_permute_fusion: true
+      moe_router_dtype: fp32
+      moe_shared_expert_overlap: false
+      moe_enable_deepep: false
+      moe_token_dispatcher_type: alltoall
+
+      # Activation recompute
+      recompute_method: uniform
+      recompute_granularity: full
+      recompute_num_layers: 1
+
+      # Pipeline
+      deallocate_pipeline_outputs: true
+      account_for_embedding_in_pipeline_split: false
+      account_for_loss_in_pipeline_split: false
+      num_layers_in_last_pipeline_stage: null
+
+
+# ── Sampler (vLLM) ────────────────────────────────────────────────────────
+
+sampler:
+  name: vllm
+  offload_sampler: true
+  gpu_memory_utilization: 0.78
+  tensor_model_parallel_size: 8
+  enable_chunked_prefill: true
+  enable_prefix_caching: false
+  enforce_eager: false
+  max_num_batched_tokens: 32768
+
+
+engine_args:
+  disable_thinking: true

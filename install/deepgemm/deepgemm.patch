@@ -1,0 +1,16 @@
+diff --git a/csrc/utils/system.hpp b/csrc/utils/system.hpp
+index 91dee12..6e6ede6 100644
+--- a/csrc/utils/system.hpp
++++ b/csrc/utils/system.hpp
+@@ -38,8 +38,9 @@ static std::tuple<int, std::string> call_external_command(std::string command) {
+     std::string output;
+     while (fgets(buffer.data(), buffer.size(), pipe.get()))
+         output += buffer.data();
+-    const auto& exit_code = WEXITSTATUS(pclose(pipe.release()));
+-    return {exit_code, output};
++    int status = pclose(pipe.release());
++    int exit_code = WEXITSTATUS(status);
++    return std::make_tuple(exit_code, output);
+ }
+ 
+ static std::vector<std::filesystem::path> collect_files(const std::filesystem::path& root) {

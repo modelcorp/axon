@@ -1,0 +1,9 @@
+# vllm is NOT installed via pip dependencies.
+# It is installed by install/vllm/install_vllm.sh (pinned release + axon patch).
+#
+# Pinned version, base commit, and optional wheel URL are defined in
+# install/vllm/install_vllm.sh.
+#
+# To install vllm:
+#   bash install/vllm/install_vllm.sh
+#   VLLM_DEV_PATH=/path/to/fork AXON_VLLM_DEV=1 bash install/vllm/install_vllm.sh

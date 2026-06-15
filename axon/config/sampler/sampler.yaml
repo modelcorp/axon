@@ -1,0 +1,142 @@
+# =============================================================================
+# Sampler Configuration
+# =============================================================================
+
+# Inference engine backend: "vllm" or "sglang"
+name: vllm
+# Path to model weights (promoted from model config)
+model_path: null
+# Whether to trust remote code in HF model configs
+trust_remote_code: false
+# LoRA rank (0 = no LoRA)
+lora_rank: 0
+# External library to import before engine init
+external_lib: null
+# Model weight data type (e.g. bfloat16, float16)
+dtype: bfloat16
+# Fraction of GPU memory reserved for KV cache (0.0–1.0)
+gpu_memory_utilization: 0.85
+# Disable CUDA graph optimization (useful for debugging or unsupported ops)
+enforce_eager: false
+# Explicit batch sizes for CUDA graph capture; null lets the engine decide
+cudagraph_capture_sizes: null
+# Hybrid engine mode — offload sampler weights/KV cache during training
+offload_sampler: true
+
+# --- Parallelism ---
+# Tensor parallelism degree for the inference engine
+tensor_model_parallel_size: 1
+# Data parallelism degree for the inference engine
+data_parallel_size: 1
+# Expert parallelism degree (MoE models only)
+expert_parallel_size: 1
+# Pipeline parallelism degree for the inference engine
+pipeline_model_parallel_size: 1
+
+# --- Batching & sequence limits ---
+# Max tokens per batch (also exported as VLLM_MAX_NUM_BATCHED_TOKENS)
+max_num_batched_tokens: 32768
+# Max model context length; null defaults to 32768
+max_model_len: null
+# Max concurrent sequences (vLLM max_num_seqs / SGLang max_running_requests)
+max_num_seqs: 1024
+
+# --- Engine optimizations ---
+# Split long prefills into chunks to reduce time-to-first-token
+enable_chunked_prefill: true
+# Cache common prompt prefixes to avoid redundant computation
+enable_prefix_caching: false
+# Model loading strategy: "dummy" for random weights, "auto" for real weights
+load_format: dummy
+# Quantization method for inference weights; null disables quantization.
+# Supported: "fp8", "fp8_fast", "int4", "mxfp8"
+#   fp8      - blockwise FP8 (e4m3) with float32 scales  (H100+)
+#   mxfp8    - group-wise FP8 (e4m3) with UE8M0 uint8 scales (Blackwell+)
+#   int4     - symmetric INT4 per-group, compressed-tensors format
+quantization: null
+# INT4-specific: group size for per-group quantization (default 128; miles uses 32 for MoE)
+int4_group_size: 128
+# INT4-specific: symmetric (true) or asymmetric (false) quantization
+int4_symmetric: true
+# Suppress engine-level logging statistics
+disable_log_stats: true
+# Extra engine-specific kwargs merged into vLLM / SGLang init args
+engine_kwargs:
+  vllm: {}
+  sglang: {}
+# Skip tokenizer initialization inside the engine
+skip_tokenizer_init: false
+
+# --- Multimodal ---
+# Cap the number of images per prompt (passed as limit_mm_per_prompt to vLLM)
+limit_images: null
+
+# --- Speculative decoding ---
+# Config dict for speculative decoding; empty dict {} disables it.
+#
+# SGLang EAGLE example (MTP-based draft model):
+#   speculative_config:
+#     speculative_algorithm: EAGLE
+#     speculative_num_steps: 3
+#     speculative_eagle_topk: 1
+#     speculative_num_draft_tokens: 4
+#
+# vLLM MTP examples (reuses the model's built-in MTP layers as drafter):
+#   # DeepSeek / MIMO / GLM4-MoE models:
+#   speculative_config:
+#     method: deepseek_mtp
+#     model: ${sampler.model_path}
+#     num_speculative_tokens: 3
+#     disable_logprobs: false
+#
+#   # Qwen3-Next models:
+#   speculative_config:
+#     method: qwen3_next_mtp
+#     model: ${sampler.model_path}
+#     num_speculative_tokens: 3
+#     disable_logprobs: false
+#
+# vLLM EAGLE example (requires a separately trained EAGLE head model):
+#   speculative_config:
+#     method: eagle
+#     model: yuhuili/EAGLE-LLaMA3-Instruct-8B
+#     num_speculative_tokens: 3
+#     disable_logprobs: false
+#
+# vLLM n-gram example (no draft model, uses prompt n-gram matching):
+#   speculative_config:
+#     method: ngram
+#     num_speculative_tokens: 8
+#     prompt_lookup_max: 8
+#
+# When speculative decoding is enabled, draft model weights are synced
+# alongside the main model during RL training so the drafter stays
+# up-to-date with the actor.
+speculative_config: {}
+
+# --- MoE communication ---
+# All-to-all backend for expert parallelism (e.g. "deepep")
+all2all_backend: deepep
+# Enable expert-parallel load balancing
+enable_eplb: false
+
+# --- P2P weight transfer ---
+# Whether to offload P2P weight-transfer buffers to CPU between transfers (disaggregated mode only)
+offload_p2p_buffer: false
+# Use layered parameter summoning for LoRA (FSDP only)
+layered_summon: false
+
+# --- Profiler ---
+profiler:
+  # Profiler tool: "nsys", "torch", "torch_memory", or null to disable
+  tool: null
+  # Whether profiling is active
+  enable: false
+  # Profile all ranks (true) or only those listed in `ranks`
+  all_ranks: false
+  # Specific ranks to profile when all_ranks is false
+  ranks: []
+  # Output directory for profiler results
+  save_path: null
+  # Tool-specific profiler config (converted to the tool's config dataclass)
+  tool_config: null

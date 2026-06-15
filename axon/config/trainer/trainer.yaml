@@ -1,0 +1,280 @@
+# =============================================================================
+# Base Trainer Configuration (shared by actor and ref)
+# =============================================================================
+# This template is imported via Hydra defaults at different config paths:
+#   - trainer/trainer@actor   → populates top-level `actor:`
+#   - trainer/trainer@ref     → populates top-level `ref:`
+
+# --- Model identity ---
+# Path to HF model weights (each role can override, e.g. critic uses a different model)
+model_path: null
+# Whether to trust remote code in HF model / tokenizer configs
+trust_remote_code: false
+# External Python module to import before model init (e.g. custom modeling code)
+external_lib: null
+# HF AutoConfig overrides (e.g. max_position_embeddings, attn_implementation)
+override_hf_config: {}
+
+# --- Optimizer ---
+# Optimizer class name, dynamically imported from `optimizer_impl` module
+optimizer: AdamW
+optimizer_args:
+  # Module path to import the optimizer from (e.g. "torch.optim", "apex.optimizers")
+  optimizer_impl: torch.optim
+  # Base learning rate
+  lr: 1.0e-06
+  # L2 regularization coefficient
+  weight_decay: 0.1
+  # Adam momentum (beta1) and variance (beta2) EMA coefficients; only applied for adam-family optimizers
+  betas:
+  - 0.9
+  - 0.95
+  # Extra kwargs merged into optimizer init args (overrides any above)
+  override_optimizer_args: {}
+
+# --- LR Scheduler ---
+# Schedule type — FSDP: "constant", "cosine"; Megatron: "constant", "linear", "cosine", "inverse_square_root"
+lr_scheduler: constant
+lr_scheduler_args:
+  # Total training steps for the run; set automatically by the trainer at init (-1 = unset)
+  total_training_steps: -1
+  # Linear warmup steps; if negative, computed from lr_warmup_steps_ratio instead
+  lr_warmup_steps: -1
+  # Warmup as a fraction of total_training_steps (used when lr_warmup_steps < 0)
+  lr_warmup_steps_ratio: 0.0
+  # Minimum LR as a fraction of base LR (cosine annealing floor)
+  min_lr_ratio: 0.0
+  # Absolute minimum LR; takes precedence over min_lr_ratio when > 0
+  min_lr: 0.0
+  # Number of cosine half-cycles (0.5 = monotonic decay from max to min)
+  num_cycles: 0.5
+  # Megatron-specific: initial LR ratio at the start of warmup
+  lr_warmup_init: 0.0
+  # Megatron-specific: number of steps over which LR decays; null defaults to total_training_steps
+  lr_decay_steps: null
+  # Megatron-specific: weight-decay schedule style ("constant", "linear", "exponential")
+  weight_decay_incr_style: constant
+  # Megatron-specific: WSD decay curve type ("linear", "exponential")
+  lr_wsd_decay_style: exponential
+  # Megatron-specific: number of steps for WSD decay; null defaults to lr_decay_steps
+  lr_wsd_decay_steps: null
+
+# --- Memory offloading ---
+# Offload model parameters to CPU between forward/backward passes to save GPU memory
+param_offload: false
+# Offload optimizer states (e.g. Adam momentum/variance) to CPU between steps
+optimizer_offload: false
+# Forward-only mode: skip optimizer/scheduler construction (used by ref and reward model workers)
+forward_only: false
+
+# --- Precision & gradients ---
+# Model/compute data type: "fp32", "fp16", "bfloat16"
+dtype: bfloat16
+# Max gradient norm for clipping (prevents exploding gradients)
+grad_clip: 1.0
+
+# --- Strategy ---
+# Distributed training backend: "fsdp", "fsdp2", or "megatron" (inherited from global config)
+strategy: ${strategy}
+
+# --- Training batch size ---
+# Global micro-batch size (divided by world_size to get per-GPU size); null = use micro_batch_size_per_gpu
+micro_batch_size: null
+# Per-GPU micro-batch size for gradient accumulation; required when use_dynamic_bsz is false
+micro_batch_size_per_gpu: null
+# Enable dynamic batch sizing based on token count instead of fixed sample count
+use_dynamic_bsz: true
+# Max total tokens per GPU per micro-batch when use_dynamic_bsz is true
+max_token_len_per_gpu: 16384
+
+# --- Forward-only batch size (inference, ref policy, value computation) ---
+# Global forward-only micro-batch size; null = use forward_micro_batch_size_per_gpu
+forward_micro_batch_size: null
+# Per-GPU micro-batch size for forward-only passes (ref log-probs, critic values, reward model)
+forward_micro_batch_size_per_gpu: null
+# Enable dynamic batch sizing for forward-only passes
+forward_use_dynamic_bsz: true
+# Max total tokens per GPU for forward-only passes
+forward_max_token_len_per_gpu: 16384
+
+# --- Data loading ---
+
+# --- Kernel optimizations ---
+# Use fused forward kernels that return log-probs and entropy directly (faster but less flexible)
+use_fused_kernels: true
+
+# --- P2P weight transfer ---
+# Offload P2P weight-transfer buffers to CPU between transfers (disaggregated mode only)
+offload_p2p_buffer: false
+
+# --- FSDP-specific ---
+fsdp:
+  wrap_policy:
+    # Min parameters for a module to be FSDP-wrapped (0 = wrap all modules)
+    min_num_params: 0
+  # Enable FSDP2 CPU offload policy (separate from param_offload)
+  offload_policy: false
+  # Reshard parameters after forward pass to reduce memory peak (FSDP2 only)
+  reshard_after_forward: false
+  # GPUs per FSDP shard group (-1 = all GPUs in one group; >1 = hybrid sharding with DDP across groups)
+  fsdp_size: -1
+  # Prefetch next layer's parameters during forward pass (FSDP1 only)
+  forward_prefetch: true
+  # Default parameter dtype for mixed precision
+  model_dtype: fp32
+  # Use original (unflattened) parameters; required for LoRA (FSDP1 only; FSDP2 always uses orig params)
+  use_orig_params: false
+  # Ulysses sequence-parallelism group size (1 = disabled)
+  ulysses_sequence_parallel_size: 1
+  # Freeze vision encoder parameters in multimodal models
+  freeze_vision_tower: false
+  # Use torch.compile for entropy computation
+  use_torch_compile: true
+  # Chunk entropy computation to reduce peak memory
+  entropy_from_logits_with_chunking: false
+  # Enable gradient checkpointing for entropy computation (trades compute for memory)
+  entropy_checkpointing: false
+  # Log a warning when gradient norm exceeds this threshold (helps detect instability)
+  grad_norm_threshold: 1.0e+05
+  # Enable gradient checkpointing (trades compute for memory by recomputing activations during backward)
+  enable_gradient_checkpointing: true
+  # Enable activation offloading to CPU between forward/backward passes (FSDP-only memory optimization)
+  enable_activation_offload: false
+  # Skip computation on padding tokens for efficiency (FSDP-only)
+  use_remove_padding: true
+  # Enable Liger kernel monkey-patching for optimized HF model forward passes
+  use_liger: false
+  # Use fused forward kernels that return log-probs and entropy directly
+  use_fused_kernels: true
+  # Options for fused kernels (impl_backend: "triton" or "torch")
+  # Triton avoids materializing the full [batch, vocab] logits tensor (+2-4% MFU)
+  # Requires use_remove_padding=true (default) and CUDA device
+  fused_kernel_options:
+    impl_backend: triton
+
+# --- LoRA (shared by FSDP and Megatron) ---
+lora:
+  # LoRA rank dimension (0 = disabled)
+  rank: 0
+  # LoRA scaling factor (effective scaling = alpha / rank)
+  alpha: 16
+  # Modules to apply LoRA to; "all-linear" targets all linear layers (FSDP),
+  # Megatron default is [linear_qkv, linear_proj, linear_fc1, linear_fc2]
+  target_modules: all-linear
+  # Modules to exclude from LoRA (null = no exclusions)
+  exclude_modules: null
+  # Path to a pre-trained LoRA adapter to resume from (null = train from scratch)
+  adapter_path: null
+
+  # --- Megatron-only ---
+  # LoRA variant: "lora", "vlm_lora", "canonical_lora", or "dora"
+  type: lora
+  # Dropout rate applied to LoRA layers
+  dropout: 0.0
+  # Where to apply dropout relative to the LoRA path: "pre" or "post"
+  dropout_position: pre
+  # Initialization method for the LoRA A matrix
+  lora_A_init_method: xavier
+  # Initialization method for the LoRA B matrix
+  lora_B_init_method: zero
+  # Enable experimental all-to-all communication for expert-parallel LoRA
+  a2a_experimental: false
+  # Override data type for LoRA parameters (null = inherit from model)
+  dtype: null
+  # Freeze vision encoder weights (vlm_lora only)
+  freeze_vision_model: true
+  # Freeze vision-language projection weights (vlm_lora only)
+  freeze_vision_projection: true
+  # Freeze language model weights (vlm_lora only)
+  freeze_language_model: true
+
+# --- Megatron-specific ---
+megatron:
+  # Freeze MoE router weights during training (MoE models only)
+  freeze_moe_router: false
+  # Offload gradients to CPU during backward pass
+  grad_offload: false
+  # Number of GPUs for tensor parallelism (splits weight matrices across GPUs)
+  tensor_model_parallel_size: 1
+  # Number of GPUs for MoE expert parallelism
+  expert_model_parallel_size: 1
+  # Tensor parallelism within expert-parallel groups; null = no expert TP
+  expert_tensor_parallel_size: null
+  # Number of GPUs for pipeline parallelism (splits layers across GPUs)
+  pipeline_model_parallel_size: 1
+  # Model chunks per pipeline stage for interleaved scheduling; null = disabled
+  virtual_pipeline_model_parallel_size: null
+  # Number of GPUs for context (sequence) parallelism
+  context_parallel_size: 1
+  # Enable sequence parallelism within tensor-parallel groups (requires TP > 1)
+  sequence_parallel: true
+  # Shard optimizer states across data-parallel ranks (ZeRO-style)
+  use_distributed_optimizer: true
+  # Load model weights from distributed checkpoint format
+  use_dist_checkpointing: false
+  # Path to distributed checkpoint directory
+  dist_checkpointing_path: null
+  # Key prefix when loading from distributed checkpoint
+  dist_checkpointing_prefix: ''
+  # Random seed for Megatron initialization and reproducibility
+  seed: 42
+  # Override DDP configuration dict (advanced)
+  override_ddp_config:
+    # Overlap gradient all-reduce with backward computation (+5-15% MFU for multi-GPU Megatron)
+    # Requires CUDA_DEVICE_MAX_CONNECTIONS=1 (already set globally in train_agent_ppo.py)
+    overlap_grad_reduce: true
+  # Override transformer configuration (activation recomputation, attention backend, etc.)
+  override_transformer_config:
+    # Fuse gradient accumulation with backward GEMM (+2-5% MFU, requires APEX)
+    gradient_accumulation_fusion: true
+    # Hidden dropout rate
+    hidden_dropout: 0.0
+    # Attention dropout rate
+    attention_dropout: 0.0
+    # Recompute granularity: null (disabled), "selective", or "full"
+    recompute_granularity: null
+    # Which modules to recompute (e.g. "core_attn")
+    recompute_modules:
+    - core_attn
+    # Recompute method: null, "uniform", or "block"
+    recompute_method: null
+    # Number of layers to recompute (used with "uniform" or "block" methods)
+    recompute_num_layers: null
+    # Attention backend: "flash", "fused", or "unfused"
+    attention_backend: flash
+  # Use MBridge for efficient HF-to-Megatron weight loading
+  use_mbridge: true
+  # Use vanilla (slower, safer) MBridge implementation
+  vanilla_mbridge: true
+  # Skip computation on padding tokens for efficiency
+  use_remove_padding: true
+  # Load pretrained weights; false = random initialization (for debugging)
+  load_weight: true
+
+# --- Profiler ---
+profiler:
+  # Profiling tool: "nsys", "torch", "torch_memory", or null to disable
+  tool: ${oc.select:global_profiler.tool,null}
+  # Whether profiling is active
+  enable: false
+  # Profile all ranks (true) or only those listed in `ranks`
+  all_ranks: false
+  # Specific ranks to profile when all_ranks is false
+  ranks: []
+  # Output directory for profiler results
+  save_path: ${oc.select:global_profiler.save_path,null}
+  # Tool-specific profiler configuration
+  tool_config:
+    nsys:
+      # Use NSYS discrete profiling mode
+      discrete: ${oc.select:global_profiler.global_tool_config.nsys.discrete,false}
+    torch:
+      # First training step to profile (inclusive)
+      step_start: 0
+      # Last training step to profile (inclusive); null = profile until end
+      step_end: null
+    torch_memory:
+      # Max allocation entries to trace
+      trace_alloc_max_entries: ${oc.select:global_profiler.global_tool_config.torch_memory.trace_alloc_max_entries,100000}
+      # Call-stack depth to capture per allocation
+      stack_depth: ${oc.select:global_profiler.global_tool_config.torch_memory.stack_depth,32}

@@ -1,0 +1,14 @@
+#!/bin/bash
+# Qwen3-Next-80B-A3B-Instruct (MoE, GDN attention) — 4 nodes × 8 H100s = 32 GPUs, hybrid, Megatron.
+MODEL_PATH=Qwen/Qwen3-Next-80B-A3B-Instruct
+NUM_NODES=4
+HYBRID_ENGINE=True
+
+TENSOR_MODEL_PARALLEL_SIZE=2
+EXPERT_MODEL_PARALLEL_SIZE=8
+PIPELINE_MODEL_PARALLEL_SIZE=4
+SAMPLER_TENSOR_MODEL_PARALLEL_SIZE=8
+
+GPU_MEMORY_UTILIZATION=0.75
+
+source "$(dirname "$0")/_common.sh"

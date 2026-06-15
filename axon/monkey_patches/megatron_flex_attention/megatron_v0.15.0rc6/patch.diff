@@ -1,0 +1,47 @@
+diff --git a/megatron/core/models/common/language_module/language_module.py b/megatron/core/models/common/language_module/language_module.py
+index d855322c..ed4e9cc3 100644
+--- a/megatron/core/models/common/language_module/language_module.py
++++ b/megatron/core/models/common/language_module/language_module.py
+@@ -100,22 +100,33 @@ class LanguageModule(MegatronModule):
+             check_and_set_env_variable("NVTE_FLASH_ATTN", 0, AttnBackend.flash)
+             check_and_set_env_variable("NVTE_FUSED_ATTN", 0, AttnBackend.flash)
+             check_and_set_env_variable("NVTE_UNFUSED_ATTN", 0, AttnBackend.flash)
++            check_and_set_env_variable("NVTE_FLEX_ATTN", 0, AttnBackend.flex)
+         elif self.config.attention_backend == AttnBackend.flash:
+             check_and_set_env_variable("NVTE_FLASH_ATTN", 1, AttnBackend.flash)
+             check_and_set_env_variable("NVTE_FUSED_ATTN", 0, AttnBackend.flash)
+             check_and_set_env_variable("NVTE_UNFUSED_ATTN", 0, AttnBackend.flash)
++            check_and_set_env_variable("NVTE_FLEX_ATTN", 0, AttnBackend.flex)
+         elif self.config.attention_backend == AttnBackend.fused:
+             check_and_set_env_variable("NVTE_FLASH_ATTN", 0, AttnBackend.fused)
+             check_and_set_env_variable("NVTE_FUSED_ATTN", 1, AttnBackend.fused)
+             check_and_set_env_variable("NVTE_UNFUSED_ATTN", 0, AttnBackend.fused)
++            check_and_set_env_variable("NVTE_FLEX_ATTN", 0, AttnBackend.flex)
+         elif self.config.attention_backend == AttnBackend.unfused:
+             check_and_set_env_variable("NVTE_FLASH_ATTN", 0, AttnBackend.unfused)
+             check_and_set_env_variable("NVTE_FUSED_ATTN", 0, AttnBackend.unfused)
+             check_and_set_env_variable("NVTE_UNFUSED_ATTN", 1, AttnBackend.unfused)
++            check_and_set_env_variable("NVTE_FLEX_ATTN", 0, AttnBackend.flex)
++        elif self.config.attention_backend == AttnBackend.flex:
++            # FlexAttention doesn't use TE backends
++            check_and_set_env_variable("NVTE_FLASH_ATTN", 0, AttnBackend.flex)
++            check_and_set_env_variable("NVTE_FUSED_ATTN", 0, AttnBackend.flex)
++            check_and_set_env_variable("NVTE_UNFUSED_ATTN", 0, AttnBackend.flex)
++            check_and_set_env_variable("NVTE_FLEX_ATTN", 1, AttnBackend.flex)
+         elif self.config.attention_backend == AttnBackend.auto:
+             check_and_set_env_variable("NVTE_FLASH_ATTN", 1, AttnBackend.auto)
+             check_and_set_env_variable("NVTE_FUSED_ATTN", 1, AttnBackend.auto)
+             check_and_set_env_variable("NVTE_UNFUSED_ATTN", 1, AttnBackend.auto)
++            check_and_set_env_variable("NVTE_FLEX_ATTN", 1, AttnBackend.auto)
+ 
+     def compute_language_model_loss(self, labels: Tensor, logits: Tensor) -> Tensor:
+         """Computes the language model loss (Cross entropy across vocabulary)
+diff --git a/megatron/core/transformer/enums.py b/megatron/core/transformer/enums.py
+index 52b82029..86e5c006 100644
+--- a/megatron/core/transformer/enums.py
++++ b/megatron/core/transformer/enums.py
+@@ -65,3 +65,4 @@ class AttnBackend(enum.Enum):
+     unfused = 3
+     local = 4
+     auto = 5
++    flex = 6

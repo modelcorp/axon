@@ -1,0 +1,217 @@
+# =============================================================================
+# Axon Docker Image — AMD ROCm MI300 (gfx942)
+# =============================================================================
+# Build:
+#   docker build -f install/docker/Dockerfile.rocm_MI300 -t axon-rocm-mi300 .
+#
+# Run:
+#   docker run --device=/dev/kfd --device=/dev/dri --shm-size=16g -it axon-rocm-mi300
+#
+# For MI350/MI355 (gfx950): copy this file to Dockerfile.rocm_MI350 and
+# change every occurrence of gfx942 → gfx950.
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Base image — ROCm 7 with pre-built vLLM support (matches miles)
+# Update this tag to the latest available from https://hub.docker.com/r/rocm/sgl-dev
+# ---------------------------------------------------------------------------
+FROM rocm/sgl-dev:rocm7-vllm-20250904
+
+ARG GPU_ARCH=gfx942
+ARG MAX_JOBS=128
+# NOTE: miles uses radixark/Megatron-LM branch miles-main which has extra
+# patches.  If you need those patches, override at build time:
+#   --build-arg MEGATRON_REPO=radixark/Megatron-LM --build-arg MEGATRON_BRANCH=miles-main
+ARG MEGATRON_REPO=NVIDIA/Megatron-LM
+ARG MEGATRON_BRANCH=main
+ARG MEGATRON_COMMIT=""
+ARG SGLANG_REPO=sgl-project/sglang
+ARG SGLANG_BRANCH=main
+ARG SGLANG_COMMIT=""
+
+# ---------------------------------------------------------------------------
+# GPU architecture environment
+# ---------------------------------------------------------------------------
+ENV GPU_ARCH=${GPU_ARCH}
+ENV PYTORCH_ROCM_ARCH=${GPU_ARCH}
+ENV GPU_ARCH_LIST=${GPU_ARCH}
+ENV AMDGPU_TARGET=${GPU_ARCH}
+ENV MAX_JOBS=${MAX_JOBS}
+
+# ---------------------------------------------------------------------------
+# ROCm performance tuning (MI300 / MI350 / MI355)
+# Matches the env vars set by the miles framework.
+# ---------------------------------------------------------------------------
+ENV HIP_FORCE_DEV_KERNARG=1
+ENV HSA_NO_SCRATCH_RECLAIM=1
+ENV SGLANG_USE_AITER=1
+ENV SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1
+ENV SGLANG_MOE_PADDING=1
+ENV SGLANG_SET_CPU_AFFINITY=1
+ENV SGLANG_ROCM_FUSED_DECODE_MLA=1
+ENV SGLANG_USE_ROCM700A=1
+ENV NCCL_MIN_NCHANNELS=112
+ENV VLLM_FP8_PADDING=1
+ENV VLLM_FP8_ACT_PADDING=1
+ENV VLLM_FP8_WEIGHT_PADDING=1
+ENV VLLM_FP8_REDUCE_CONV=1
+ENV TORCHINDUCTOR_MAX_AUTOTUNE=1
+ENV TORCHINDUCTOR_MAX_AUTOTUNE_POINTWISE=1
+
+# Ray + ROCm device visibility
+ENV RAY_EXPERIMENTAL_NOSET_HIP_VISIBLE_DEVICES=1
+
+SHELL ["/bin/bash", "-ceuxo", "pipefail"]
+WORKDIR /app
+
+# ---------------------------------------------------------------------------
+# 1. AITER — AMD inference/training engine runtime (ROCm kernel library)
+# ---------------------------------------------------------------------------
+RUN cd /app && \
+    git clone https://github.com/ROCm/aiter.git && \
+    cd aiter && \
+    git checkout v0.1.10.post3 && \
+    curl -fsSL https://patch-diff.githubusercontent.com/raw/ROCm/aiter/pull/2075.patch \
+        -o /tmp/aiter-pr2075.patch && \
+    git apply --3way /tmp/aiter-pr2075.patch && \
+    rm -f /tmp/aiter-pr2075.patch && \
+    git submodule sync --recursive && \
+    git submodule update --init --recursive && \
+    GPU_ARCHS=${GPU_ARCH} python setup.py develop
+
+# ---------------------------------------------------------------------------
+# 2. TransformerEngine for ROCm
+# ---------------------------------------------------------------------------
+ENV NVTE_FRAMEWORK=pytorch
+ENV NVTE_ROCM_ARCH=${GPU_ARCH}
+ENV NVTE_USE_HIPBLASLT=1
+ENV NVTE_USE_ROCM=1
+ENV CMAKE_PREFIX_PATH="/opt/rocm:/opt/rocm/hip:/usr/local:/usr"
+RUN cd /app && \
+    git clone https://github.com/ROCm/TransformerEngine.git && \
+    cd TransformerEngine && \
+    git checkout 90c04bcdc3c109505b318f40a39680263af55edf && \
+    git submodule update --init --recursive && \
+    pip install -v --no-cache-dir .
+
+# ---------------------------------------------------------------------------
+# 3. Megatron-LM
+# ---------------------------------------------------------------------------
+RUN cd /app && \
+    git clone https://github.com/${MEGATRON_REPO}.git Megatron-LM && \
+    cd Megatron-LM && \
+    git fetch origin ${MEGATRON_BRANCH} && \
+    git checkout FETCH_HEAD && \
+    if [ -n "${MEGATRON_COMMIT}" ]; then git checkout ${MEGATRON_COMMIT}; fi && \
+    pip install --no-cache-dir "numpy>=1.21.0,<2.0" --force-reinstall && \
+    pip install --no-cache-dir -e .
+
+# ---------------------------------------------------------------------------
+# 4. mbridge
+# ---------------------------------------------------------------------------
+RUN pip install --no-cache-dir git+https://github.com/ISEEKYAN/mbridge.git --no-deps || true
+
+# ---------------------------------------------------------------------------
+# 5. Ray (pinned version for compatibility, matching miles)
+# ---------------------------------------------------------------------------
+RUN pip install --no-cache-dir "ray[data,train,tune,serve]==2.47.1"
+
+# ---------------------------------------------------------------------------
+# 6. torch_memory_saver
+# ---------------------------------------------------------------------------
+RUN cd /tmp && \
+    git clone https://github.com/fzyzcjy/torch_memory_saver.git && \
+    cd torch_memory_saver && \
+    git checkout 64a92e1d7fb822ea4af5579c8cebb162692c531c && \
+    pip install --no-cache-dir --force-reinstall . && \
+    cd / && rm -rf /tmp/torch_memory_saver
+
+# ---------------------------------------------------------------------------
+# 7. ROCm Apex
+# ---------------------------------------------------------------------------
+RUN cd /tmp && \
+    git clone https://github.com/ROCm/apex.git && \
+    cd apex && \
+    python setup.py install && \
+    cd / && rm -rf /tmp/apex
+
+# ---------------------------------------------------------------------------
+# 8. SGLang + sgl-kernel (built for ROCm)
+# ---------------------------------------------------------------------------
+RUN pip install --no-cache-dir IPython orjson python-multipart "torchao==0.9.0" pybind11
+
+RUN cd /app && \
+    git clone https://github.com/${SGLANG_REPO}.git sglang && \
+    cd sglang && \
+    git fetch origin ${SGLANG_BRANCH} && \
+    git checkout FETCH_HEAD && \
+    if [ -n "${SGLANG_COMMIT}" ]; then git checkout ${SGLANG_COMMIT}; fi
+
+# Build sgl-kernel with ROCm pyproject
+RUN cd /app/sglang/sgl-kernel && \
+    if [ -f pyproject_rocm.toml ]; then \
+        mv pyproject.toml pyproject_backup.toml 2>/dev/null || true && \
+        mv pyproject_rocm.toml pyproject.toml && \
+        AMDGPU_TARGET=${GPU_ARCH} python setup_rocm.py install; \
+    else \
+        echo "No pyproject_rocm.toml found, skipping sgl-kernel ROCm build"; \
+    fi
+
+# Install SGLang Python package
+RUN cd /app/sglang && \
+    if [ -f python/pyproject_other.toml ]; then \
+        mv python/pyproject.toml python/pyproject_backup.toml 2>/dev/null || true && \
+        mv python/pyproject_other.toml python/pyproject.toml; \
+    fi && \
+    pip install --no-cache-dir -e "python[all_hip]" || \
+    pip install --no-cache-dir -e "python[all]"
+
+# ---------------------------------------------------------------------------
+# 9. Post-install configuration
+# ---------------------------------------------------------------------------
+# Reinstall Megatron (editable) after any prior numpy changes
+RUN cd /app/Megatron-LM && pip install --no-cache-dir -e . -v
+
+# SGLang ROCm patch (HIP CustomAllreduce) is applied at runtime via
+# axon/monkey_patches/sglang/rocm_allreduce.py — no Docker patch needed.
+
+# Copy MOE configs for MI300X variants (MI300X_VF and MI355)
+RUN find /app/sglang/python/sglang/srt/layers/quantization/configs/ \
+         /app/sglang/python/sglang/srt/layers/moe/fused_moe_triton/configs/ \
+         -type f -name '*MI300X*' 2>/dev/null | while read f; do \
+        cp "$f" "$(echo $f | sed 's/MI300X/MI300X_VF/')" 2>/dev/null || true; \
+        cp "$f" "$(echo $f | sed 's/MI300X/MI355/')" 2>/dev/null || true; \
+    done
+
+# ---------------------------------------------------------------------------
+# 10. Additional packages
+# ---------------------------------------------------------------------------
+RUN pip install --no-cache-dir sglang-router --force-reinstall || true
+RUN pip install --no-cache-dir click==8.2.1  # Fix Ray / Python 3.10 click compat
+RUN pip install --no-cache-dir hydra-core omegaconf cloudpickle wandb tensorboard
+
+# ---------------------------------------------------------------------------
+# 11. Copy and install Axon (editable)
+# ---------------------------------------------------------------------------
+COPY . /app/axon
+RUN cd /app/axon && pip install --no-cache-dir --no-deps -e .
+
+# ---------------------------------------------------------------------------
+# 12. Verify installation
+# ---------------------------------------------------------------------------
+RUN python -c "\
+import torch; \
+print(f'PyTorch {torch.__version__}, HIP: {torch.version.hip}'); \
+assert torch.cuda.is_available(), 'torch.cuda not available'; \
+from axon.utils.rocm_utils import is_rocm; \
+assert is_rocm(), 'Expected ROCm platform'; \
+print('ROCm verification: OK')"
+
+RUN python -c "import sglang; import sgl_kernel; print('SGLang + sgl_kernel: OK')" || \
+    echo "WARNING: SGLang/sgl_kernel import failed (may need branch update)"
+
+# Clean pip cache
+RUN python -m pip cache purge || true
+
+WORKDIR /app
+ENTRYPOINT ["/bin/bash"]

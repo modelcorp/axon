@@ -1,0 +1,855 @@
+diff --git a/transformer_engine/pytorch/attention/dot_product_attention/backends.py b/transformer_engine/pytorch/attention/dot_product_attention/backends.py
+index afa1bae6..2a372441 100644
+--- a/transformer_engine/pytorch/attention/dot_product_attention/backends.py
++++ b/transformer_engine/pytorch/attention/dot_product_attention/backends.py
+@@ -7,12 +7,14 @@ from contextlib import nullcontext
+ from importlib.metadata import version as get_pkg_version
+ from importlib.metadata import PackageNotFoundError
+ import os
+-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
++import functools
++from typing import Any, Callable, ClassVar, Dict, List, Optional, Tuple, Union
+ import warnings
+ import logging
+ from packaging.version import Version as PkgVersion
+ 
+ import torch
++import torch.nn.functional as F
+ import transformer_engine_torch as tex
+ from transformer_engine.pytorch.utils import (
+     SplitAlongDim,
+@@ -1638,3 +1640,500 @@ class FusedAttention(torch.nn.Module):
+ 
+         # ...hd -> ...(hd)
+         return output.view(*output.shape[:-2], -1)
++
++
++# Try to import flex_attention
++flex_attention_available = False
++try:
++    from torch.nn.attention.flex_attention import (
++        _mask_mod_signature,
++        BlockMask,
++        create_block_mask,
++        flex_attention,
++    )
++    flex_attention_available = True
++except ImportError:
++    pass  # FlexAttention will be disabled if import fails
++
++
++# FlexAttention mask type keys
++# Registration key (without seq_len, used during __init__)
++FLEX_ATTN_MASK_REG_T = tuple[str, int | None]
++# Full mask key (with seq_len, used for caching actual masks)
++FLEX_ATTN_MASK_T = tuple[str, int | None, int]
++
++def get_kernel_options(query, block_m, block_n,
++                       use_direct_build: bool) -> dict[str, Union[int, bool]]:
++    kernel_options: dict[str, Union[int, bool]] = {
++        "FORCE_USE_FLEX_ATTENTION": True,
++    }
++    kernel_options["BLOCK_M"] = 16
++    kernel_options["BLOCK_N"] = 16
++    kernel_options["IS_DIVISIBLE"] = False
++    return kernel_options
++    if use_direct_build:
++        kernel_options["BLOCK_M"] = block_m
++        kernel_options["BLOCK_N"] = block_n
++        return kernel_options
++    else:
++        kernel_options["BLOCK_M"] = 64
++        kernel_options["BLOCK_N"] = 64
++        if query.dtype == torch.float32:
++            kernel_options["BLOCK_M"] = 32
++            kernel_options["BLOCK_N"] = 32
++        # if current_platform.is_cuda():
++        if torch.cuda.is_available():
++            device_props = torch.cuda.get_device_properties()
++            max_shared_memory = device_props.shared_memory_per_block_optin
++            if max_shared_memory < 144 * 1024:
++                kernel_options["BLOCK_M"] = kernel_options["BLOCK_M"] // 2
++                kernel_options["BLOCK_N"] = kernel_options["BLOCK_N"] // 2
++
++    return kernel_options
++
++
++class FlexAttentionBackend(torch.nn.Module):
++    """FlexAttention backend using torch.nn.attention.flex_attention.
++
++    This backend implements flexible attention patterns using PyTorch's native
++    flex_attention API, which allows for custom masking patterns through mask
++    modification functions.
++
++    Args:
++        softmax_scale (float): Scaling factor for attention scores.
++        attention_type (str): Type of attention ("self" or "cross").
++        attn_mask_type (str): The type of attention mask. Currently supports
++            "causal" and "block_causal". "causal" means the lower triangle of the
++            attention matrix is masked. "block_causal" means the attention matrix
++            is divided into blocks where block boundary is defined by EOS token,
++            and the lower triangle of each block is masked.
++        fixed_block_size (int | None): The block size to be used to perform attention.
++            If specified, each sequence will be further divided to blocks, where each
++            block has the maximum size of ``fixed_block_size``. A query will only attend
++            to the keys within the same block.
++        attention_dropout (float): Dropout probability.
++        attention_dropout_ctx (Callable): Context manager for dropout.
++        layer_number (Optional[int]): Layer number identifier.
++    """
++
++    # Class variables for compiled functions and caching
++    flex_attn: ClassVar[Callable] = None
++    compiled_create_block_mask: ClassVar[Callable] = None
++    used_attn_mask_types: ClassVar[set[FLEX_ATTN_MASK_REG_T]] = set()
++    block_masks: ClassVar[dict[FLEX_ATTN_MASK_T, BlockMask]] = {}
++    _initialized: ClassVar[bool] = False
++
++    def __init__(
++        self,
++        softmax_scale: float,
++        attention_type: str = "self",
++        attn_mask_type: str = "causal",
++        fixed_block_size: int | None = None,
++        attention_dropout: float = 0.0,
++        attention_dropout_ctx: Optional[Callable] = nullcontext,
++        layer_number: Optional[int] = None,
++    ) -> None:
++        super().__init__()
++
++        if not flex_attention_available:
++            raise RuntimeError(
++                "FlexAttention backend requires PyTorch with flex_attention support. "
++                "Please upgrade to a version that includes torch.nn.attention.flex_attention."
++            )
++
++        # Support various causal mask types
++        # padding_causal = causal with padding handling
++        # causal_bottom_right = causal aligned to bottom right
++        supported_mask_types = [
++            "causal",
++            "block_causal", 
++            "padding_causal",
++            "causal_bottom_right",
++            "padding_causal_bottom_right"
++        ]
++        if attn_mask_type not in supported_mask_types:
++            raise ValueError(
++                f"FlexAttention backend only supports {supported_mask_types}, "
++                f"got {attn_mask_type}."
++            )
++
++        self.softmax_scale = softmax_scale
++        self.attention_type = attention_type
++        self.attn_mask_type = attn_mask_type
++        self.fixed_block_size = fixed_block_size
++        self.attention_dropout = attention_dropout
++        self.attention_dropout_ctx = attention_dropout_ctx
++        self.layer_number = 1 if layer_number is None else layer_number
++
++        # Initialize class-level compiled functions once
++        if not FlexAttentionBackend._initialized:
++            FlexAttentionBackend.flex_attn = torch.compile(
++                flex_attention, mode="max-autotune-no-cudagraphs"
++            )
++            FlexAttentionBackend.compiled_create_block_mask = torch.compile(create_block_mask)
++            FlexAttentionBackend._initialized = True
++
++        # Register this mask type
++        FlexAttentionBackend.used_attn_mask_types.add(self.mask_key)
++
++        self.logger = logging.getLogger("FlexAttention")
++        if attn_log._is_logging_setup is False:
++            attn_log.setup_logging()
++        self.logger.setLevel(attn_log._log_level)
++        if not self.logger.hasHandlers():
++            self.logger.addHandler(attn_log._stream_handler)
++
++    @property
++    def mask_key(self) -> FLEX_ATTN_MASK_REG_T:
++        """Generate a registration key for this mask configuration (without seq_len)."""
++        return (self.attn_mask_type, self.fixed_block_size)
++
++    @staticmethod
++    def _get_causal_mask_mod() -> _mask_mod_signature:
++        """Create a causal mask modification function."""
++        def causal_mask(
++            b: torch.Tensor, h: torch.Tensor, q_idx: torch.Tensor, kv_idx: torch.Tensor
++        ):
++            return q_idx >= kv_idx
++
++        return causal_mask
++
++    @staticmethod
++    def _get_block_causal_mask_mod(
++        batch: torch.Tensor, eos_id: int
++    ) -> _mask_mod_signature:
++        """Create a block causal mask modification function.
++        
++        Args:
++            batch: Tensor of shape [b, s, h, d] or [b, s]
++            eos_id: The token ID that marks end of sequence
++        """
++        # Handle different input shapes
++        if batch.ndim == 4:
++            # [b, s, h, d] - take first element across h and d dimensions
++            batch_tokens = batch[:, :, 0, 0]
++        elif batch.ndim == 2:
++            # [b, s]
++            batch_tokens = batch
++        else:
++            raise ValueError(f"Unexpected batch shape: {batch.shape}")
++        
++        mask = batch_tokens == eos_id
++        mask[:, -1] = True
++        acc_mask = torch.cumsum(torch.where(mask, 1, 0), dim=1)
++        seq_idx = torch.zeros_like(acc_mask, dtype=torch.int32)
++        seq_idx[:, 1:] = acc_mask[:, :-1]
++
++        def block_causal_mask(
++            b: torch.Tensor, h: torch.Tensor, q_idx: torch.Tensor, kv_idx: torch.Tensor
++        ):
++            return (seq_idx[b, q_idx] == seq_idx[b, kv_idx]) & (q_idx >= kv_idx)
++
++        return block_causal_mask
++
++    @staticmethod
++    def _fixed_block_mask_mod(
++        mask_mod: _mask_mod_signature, fixed_block_size: int
++    ) -> _mask_mod_signature:
++        """Wrap a mask mod to apply fixed block partitioning.
++        
++        This restricts attention to within fixed-size blocks while still applying
++        the underlying mask (e.g., causal) using global token positions.
++        
++        Args:
++            mask_mod: The base mask modification function
++            fixed_block_size: The number of tokens in each block
++        """
++        def blocked_mask_mod(
++            b: torch.Tensor, h: torch.Tensor, q_idx: torch.Tensor, kv_idx: torch.Tensor
++        ):
++            # Get the block index of the query and key
++            q_block = q_idx // fixed_block_size
++            kv_block = kv_idx // fixed_block_size
++            # Only allow attention within the same block
++            same_block = q_block == kv_block
++            # Apply the original mask mod with GLOBAL indices (not local)
++            # This ensures causal masking respects global token positions
++            inner_mask = mask_mod(b, h, q_idx, kv_idx)
++            return same_block & inner_mask
++
++        blocked_mask_mod.__name__ = (
++            f"blocked_mask_mod_{mask_mod.__name__}_fixed_block_size_{fixed_block_size}"
++        )
++        return blocked_mask_mod
++
++    @staticmethod
++    @torch.no_grad()
++    def init_attention_mask(
++        batch: torch.Tensor, 
++        eos_id: int | None,
++        cp_mesh: torch.distributed.device_mesh.DeviceMesh | None = None,
++    ) -> None:
++        """Initialize attention masks for all registered mask types.
++        
++        Args:
++            batch: Input batch tensor, shape can be [b, s, h, d] or [b, s]
++            eos_id: End-of-sequence token ID (required for block_causal)
++            cp_mesh: Context parallel device mesh (not yet fully supported)
++        """
++        # Handle CP mesh if provided
++        if cp_mesh is not None:
++            try:
++                from torch.distributed.tensor.experimental._attention import create_cp_block_mask
++                FlexAttentionBackend.compiled_create_block_mask = functools.partial(
++                    create_cp_block_mask, device_mesh=cp_mesh
++                )
++            except ImportError:
++                warnings.warn(
++                    "Context parallelism with FlexAttention requires torch.distributed.tensor "
++                    "with create_cp_block_mask support. Falling back to standard block mask."
++                )
++
++        for reg_key in FlexAttentionBackend.used_attn_mask_types:
++            attn_mask_type, fixed_block_size = reg_key
++            
++            # Determine sequence length from batch
++            if batch.ndim == 4:
++                seq_len = batch.shape[1]  # [b, s, h, d]
++            elif batch.ndim == 2:
++                seq_len = batch.shape[1]  # [b, s]
++            else:
++                raise ValueError(f"Unexpected batch shape: {batch.shape}")
++            
++            # Create new mask key with actual sequence length
++            actual_mask_key = (attn_mask_type, fixed_block_size, seq_len)
++            
++            # Skip if already initialized for this exact configuration
++            if FlexAttentionBackend.block_masks.get(actual_mask_key, None) is not None:
++                continue
++            
++            # Determine batch dimension and create mask mod
++            if attn_mask_type == "causal":
++                # Causal mask is batch-agnostic
++                batch_dimension = 1
++                mask_mod = FlexAttentionBackend._get_causal_mask_mod()
++            elif attn_mask_type == "block_causal":
++                if eos_id is None:
++                    raise RuntimeError(
++                        "eos_id must be provided for block_causal mask."
++                    )
++                # Extract batch dimension
++                batch_dimension = batch.shape[0]
++                mask_mod = FlexAttentionBackend._get_block_causal_mask_mod(batch, eos_id)
++            else:
++                raise RuntimeError(f"Unsupported mask type: {attn_mask_type}")
++
++            # NOTE: fixed_block_size is used for compilation hints, not to change mask pattern
++            # If you want block-sparse attention, use "block_causal" mask type instead
++
++            # Create block mask
++            block_mask = FlexAttentionBackend.compiled_create_block_mask(
++                mask_mod, batch_dimension, None, seq_len, seq_len, BLOCK_SIZE=(self.fixed_block_size, self.fixed_block_size),
++            )
++            FlexAttentionBackend.block_masks[actual_mask_key] = block_mask
++
++    def forward(
++        self,
++        query_layer: torch.Tensor,
++        key_layer: torch.Tensor,
++        value_layer: torch.Tensor,
++        qkv_layout: str = "sbh3d",
++        attn_mask_type: str = None,
++        cu_seqlens_q: torch.Tensor = None,
++        cu_seqlens_kv: torch.Tensor = None,
++        max_seqlen_q: int = None,
++        max_seqlen_kv: int = None,
++        **kwargs
++    ) -> torch.Tensor:
++        """FlexAttention forward pass.
++        
++        Args:
++            query_layer: Query tensor
++            key_layer: Key tensor
++            value_layer: Value tensor
++            qkv_layout: Layout format (e.g., "sbhd", "bshd", "thd")
++            attn_mask_type: Override for attention mask type
++            cu_seqlens_q: Cumulative sequence lengths for query (for THD format)
++            cu_seqlens_kv: Cumulative sequence lengths for key/value (for THD format)
++            max_seqlen_q: Maximum sequence length for query (for THD format)
++            max_seqlen_kv: Maximum sequence length for key/value (for THD format)
++            **kwargs: Additional arguments (ignored for compatibility)
++        
++        Returns:
++            Attention output tensor
++        """
++        import transformer_engine_torch as tex
++        
++        # Use mask type from initialization if not provided
++        if attn_mask_type is None:
++            attn_mask_type = self.attn_mask_type
++        
++        # For padding_causal variants, treat as causal for mask purposes
++        mask_type_for_key = attn_mask_type
++        if "padding_causal" in attn_mask_type:
++            mask_type_for_key = "causal"
++        elif attn_mask_type == "causal_bottom_right":
++            mask_type_for_key = "causal"
++        
++        # Determine actual sequence length from input
++        if qkv_layout in ["thd", "thd_thd_thd"]:
++            # For THD, seq_len is from max_seqlen parameter
++            seq_len = max_seqlen_q if max_seqlen_q is not None else 2048
++            batch_dimension = len(cu_seqlens_q) - 1 if cu_seqlens_q is not None else 1
++        elif qkv_layout in ["sbhd", "sbh3d", "sbhd_sbhd_sbhd"]:
++            # For SBHD: [seq, batch, heads, dim]
++            seq_len = query_layer.shape[0] if query_layer.ndim == 4 else 2048
++            batch_dimension = query_layer.shape[1] if query_layer.ndim == 4 else 1
++        else:
++            # For BSHD: [batch, seq, heads, dim]
++            seq_len = query_layer.shape[1] if query_layer.ndim == 4 else 2048
++            batch_dimension = query_layer.shape[0] if query_layer.ndim == 4 else 1
++        
++        # Create full mask key with sequence length
++        mask_key = (mask_type_for_key, self.fixed_block_size, seq_len)
++        
++        # Auto-initialize mask if not already initialized for this seq_len
++        if mask_key not in FlexAttentionBackend.block_masks:
++            # Create mask mod function
++            if mask_type_for_key == "causal":
++                mask_mod = FlexAttentionBackend._get_causal_mask_mod()
++            elif mask_type_for_key == "block_causal":
++                # For block_causal, we can't auto-initialize without batch tokens and eos_id
++                raise RuntimeError(
++                    f"FlexAttention mask for block_causal requires initialization with batch tokens and eos_id. "
++                    "Please call attention.init_flex_attention_mask(batch=input_tokens, eos_id=eos_token_id) "
++                    "before the forward pass."
++                )
++            else:
++                raise RuntimeError(f"Unsupported mask type for auto-initialization: {mask_type_for_key}")
++            
++            # NOTE: fixed_block_size is used for compilation hints, not to change mask pattern
++            # If you want block-sparse attention, use "block_causal" mask type instead
++            
++            # Create and cache the block mask
++            # For causal masks, we only need batch_dimension=1 (mask is same for all batches)
++            block_mask = FlexAttentionBackend.compiled_create_block_mask(
++                mask_mod, 
++                1 if mask_type_for_key == "causal" else batch_dimension,
++                None, 
++                seq_len, 
++                seq_len,
++                BLOCK_SIZE=(self.fixed_block_size, self.fixed_block_size),
++            )
++            FlexAttentionBackend.block_masks[mask_key] = block_mask
++            
++            self.logger.debug(
++                "Auto-initialized FlexAttention mask: type=%s, fixed_block_size=%s, seq_len=%d",
++                mask_type_for_key, self.fixed_block_size, seq_len
++            )
++        
++        # Get the block mask
++        block_mask = FlexAttentionBackend.block_masks[mask_key]
++        
++        # Store original format for output conversion
++        original_layout = qkv_layout
++        total_tokens_q = None
++        batch_size = None
++        
++        # Handle different QKV layouts
++        # FlexAttention expects BHSD format (batch, heads, seq, dim)
++        if qkv_layout in ["thd", "thd_thd_thd"]:
++            # THD format: [total_tokens, num_heads, head_dim]
++            # Need to convert to BSHD first
++            if cu_seqlens_q is None or max_seqlen_q is None:
++                raise ValueError("cu_seqlens_q and max_seqlen_q required for THD format")
++            
++            total_tokens_q = query_layer.shape[0]
++            batch_size = len(cu_seqlens_q) - 1
++            
++            # Convert THD to BSHD using TE utility
++            query_layer = tex.convert_thd_to_bshd(
++                query_layer,
++                cu_seqlens_q,
++                batch_size,
++                max_seqlen_q,
++            )
++            key_layer = tex.convert_thd_to_bshd(
++                key_layer,
++                cu_seqlens_kv,
++                batch_size,
++                max_seqlen_kv,
++            )
++            value_layer = tex.convert_thd_to_bshd(
++                value_layer,
++                cu_seqlens_kv,
++                batch_size,
++                max_seqlen_kv,
++            )
++            # Now in BSHD format
++        elif qkv_layout in ["sbhd", "sbh3d", "sbhd_sbhd_sbhd"]:
++            # [s, b, h, d] -> [b, s, h, d]
++            query_layer = query_layer.transpose(0, 1)
++            key_layer = key_layer.transpose(0, 1)
++            value_layer = value_layer.transpose(0, 1)
++        elif qkv_layout in ["bshd", "bsh3d", "bshd_bshd_bshd"]:
++            # Already in [b, s, h, d] format
++            pass
++        else:
++            raise ValueError(f"Unsupported qkv_layout: {qkv_layout}")
++        
++        # Ensure contiguous memory layout
++        query_layer = query_layer.contiguous()
++        key_layer = key_layer.contiguous()
++        value_layer = value_layer.contiguous()
++        
++        # FlexAttention expects [batch, seq, heads, dim] -> need to transpose
++        # Current: [b, s, h, d]
++        # Required: [b, h, s, d]
++        query_layer = query_layer.transpose(1, 2)
++        key_layer = key_layer.transpose(1, 2)
++        value_layer = value_layer.transpose(1, 2)
++        
++        # Detect GQA (Grouped Query Attention)
++        # GQA: multiple query heads share the same key/value heads
++        num_q_heads = query_layer.shape[1]  # [b, h_q, s, d]
++        num_kv_heads = key_layer.shape[1]   # [b, h_kv, s, d]
++        enable_gqa = num_q_heads != num_kv_heads
++        
++        if enable_gqa:
++            self.logger.debug(
++                "GQA detected: %d query heads, %d key/value heads",
++                num_q_heads, num_kv_heads
++            )
++        
++        # Apply flex attention
++        with self.attention_dropout_ctx():
++            kernel_options = get_kernel_options(query_layer, self.fixed_block_size, self.fixed_block_size,
++                True)
++            output = FlexAttentionBackend.flex_attn(
++                query_layer, 
++                key_layer, 
++                value_layer, 
++                block_mask=block_mask, 
++                scale=self.softmax_scale,
++                enable_gqa=enable_gqa,
++                kernel_options=kernel_options
++            )
++        
++        # Convert back to original layout: [b, h, s, d] -> [b, s, h, d]
++        output = output.transpose(1, 2)
++        
++        # Convert back to original input layout if needed
++        if original_layout in ["thd", "thd_thd_thd"]:
++            # Convert back from BSHD to THD
++            output = tex.convert_bshd_to_thd(
++                output,
++                cu_seqlens_q,
++                total_tokens_q,
++            )
++            # Output is now [total_tokens, num_heads, head_dim]
++            # Flatten to [total_tokens, num_heads * head_dim]
++            output = output.contiguous()
++            return output.view(output.shape[0], -1)
++        elif original_layout in ["sbhd", "sbh3d", "sbhd_sbhd_sbhd"]:
++            # [b, s, h, d] -> [s, b, h, d]
++            output = output.transpose(0, 1)
++        
++        # Flatten to [..., h*d]
++        output = output.contiguous()
++        return output.view(*output.shape[:-2], -1)
+diff --git a/transformer_engine/pytorch/attention/dot_product_attention/dot_product_attention.py b/transformer_engine/pytorch/attention/dot_product_attention/dot_product_attention.py
+index b35b87a8..763f033c 100644
+--- a/transformer_engine/pytorch/attention/dot_product_attention/dot_product_attention.py
++++ b/transformer_engine/pytorch/attention/dot_product_attention/dot_product_attention.py
+@@ -44,6 +44,8 @@ from transformer_engine.pytorch.attention.dot_product_attention.backends import
+     UnfusedDotProductAttention,
+     FusedAttention,
+     FlashAttention,
++    FlexAttentionBackend,
++    flex_attention_available,
+ )
+ 
+ 
+@@ -57,6 +59,7 @@ _attention_backends = {
+     "flash_attention_backend": None,
+     "use_fused_attention": None,
+     "fused_attention_backend": None,
++    "use_flex_attention": None,
+     "use_unfused_attention": None,
+     "backend_selection_requires_update": False,
+ }
+@@ -337,6 +340,24 @@ class DotProductAttention(TransformerEngineBaseModule):
+             layer_number=layer_number,
+         )
+ 
++        # Instantiate FlexAttention backend if available
++        self.flex_attention = None
++        if flex_attention_available:
++            try:
++                self.flex_attention = FlexAttentionBackend(
++                    softmax_scale,
++                    attention_type=attention_type,
++                    attn_mask_type=attn_mask_type,
++                    fixed_block_size=16,  # Can be made configurable via constructor args
++                    layer_number=layer_number,
++                    **attn_kwargs,
++                )
++            except Exception as e:
++                self.logger.warning(
++                    "Failed to initialize FlexAttention backend: %s. "
++                    "FlexAttention will not be available.", str(e)
++                )
++
+         def remove_extra_states_check(self, incompatible_keys):  # pylint: disable=unused-argument
+             """
+             Temporarily remove core_attention._extra_state as a missing key
+@@ -433,6 +454,29 @@ class DotProductAttention(TransformerEngineBaseModule):
+         self.cp_stream = cp_stream
+         self.cp_comm_type = cp_comm_type
+ 
++    def init_flex_attention_mask(
++        self,
++        batch: torch.Tensor,
++        eos_id: int | None = None,
++        cp_mesh: torch.distributed.device_mesh.DeviceMesh | None = None,
++    ) -> None:
++        """Initialize FlexAttention masks.
++        
++        This method should be called before the forward pass when using FlexAttention
++        backend, typically once per batch or when the batch structure changes.
++        
++        Parameters
++        ----------
++        batch : torch.Tensor
++               Input batch tensor, can be of shape [b, s, h, d] or [b, s].
++        eos_id : int | None, default = `None`
++                End-of-sequence token ID. Required for block_causal mask type.
++        cp_mesh : torch.distributed.device_mesh.DeviceMesh | None, default = `None`
++                Context parallel device mesh for distributed attention.
++        """
++        if self.flex_attention is not None and flex_attention_available:
++            FlexAttentionBackend.init_attention_mask(batch, eos_id, cp_mesh)
++
+     @no_torch_dynamo(recursive=False)
+     def forward(
+         self,
+@@ -963,12 +1007,14 @@ class DotProductAttention(TransformerEngineBaseModule):
+                 fp8_meta=self.fp8_meta,
+                 inference_params=inference_params,
+             )
++
+             global _attention_backends
+             if is_in_onnx_export_mode():
+                 # We do not want to call get_attention_backend() in ONNX mode
+                 # and we want to avoid using any global variables like _attention_backends.
+                 use_flash_attention = False
+                 use_fused_attention = False
++                use_flex_attention = False
+                 use_unfused_attention = True
+             else:
+                 if (
+@@ -983,6 +1029,7 @@ class DotProductAttention(TransformerEngineBaseModule):
+                         flash_attention_backend,
+                         use_fused_attention,
+                         fused_attention_backend,
++                        use_flex_attention,
+                         use_unfused_attention,
+                         _,
+                     ) = dpa_utils.get_attention_backend(attention_params)
+@@ -992,8 +1039,10 @@ class DotProductAttention(TransformerEngineBaseModule):
+                     _attention_backends["flash_attention_backend"] = flash_attention_backend
+                     _attention_backends["use_fused_attention"] = use_fused_attention
+                     _attention_backends["fused_attention_backend"] = fused_attention_backend
++                    _attention_backends["use_flex_attention"] = use_flex_attention
+                     _attention_backends["use_unfused_attention"] = use_unfused_attention
+                     _attention_backends["backend_selection_requires_update"] = False
++                    
+                     if use_flash_attention:
+                         self.logger.info(
+                             "Running with FlashAttention backend (version %s)",
+@@ -1004,6 +1053,8 @@ class DotProductAttention(TransformerEngineBaseModule):
+                             "Running with FusedAttention backend (sub-backend %s)",
+                             int(fused_attention_backend),
+                         )
++                    elif use_flex_attention:
++                        self.logger.info("Running with FlexAttention backend")
+                     elif use_unfused_attention:
+                         self.logger.info("Running with UnfusedDotProductAttention backend")
+                 else:
+@@ -1011,15 +1062,39 @@ class DotProductAttention(TransformerEngineBaseModule):
+                     flash_attention_backend = _attention_backends["flash_attention_backend"]
+                     use_fused_attention = _attention_backends["use_fused_attention"]
+                     fused_attention_backend = _attention_backends["fused_attention_backend"]
++                    use_flex_attention = _attention_backends["use_flex_attention"]
+                     use_unfused_attention = _attention_backends["use_unfused_attention"]
+ 
+             # raise exception if no backend is available
+-            if sum([use_flash_attention, use_fused_attention, use_unfused_attention]) == 0:
+-                raise ValueError(
+-                    "No dot product attention backend is available for the provided inputs. Please"
+-                    " run with NVTE_DEBUG=1 NVTE_DEBUG_LEVEL=2 to find out the reasons for"
+-                    " disabling all backends."
++            if sum([use_flash_attention, use_fused_attention, use_flex_attention, use_unfused_attention]) == 0:
++                error_msg = (
++                    "No dot product attention backend is available for the provided inputs.\n"
++                    "\n"
++                    "Configuration:\n"
++                    f"  - qkv_format: {qkv_format}\n"
++                    f"  - qkv_dtype: {query_layer.dtype}\n"
++                    f"  - attn_mask_type: {attn_mask_type}\n"
++                    f"  - context_parallel: {context_parallel}\n"
++                    f"  - fp8: {self.fp8}\n"
++                    f"  - inference_params: {inference_params is not None}\n"
++                    f"  - max_seqlen_q: {max_seqlen_q}, max_seqlen_kv: {max_seqlen_kv}\n"
++                    "\n"
++                    "Backend status (from environment):\n"
++                    f"  - NVTE_FLASH_ATTN: {os.getenv('NVTE_FLASH_ATTN', '1')}\n"
++                    f"  - NVTE_FUSED_ATTN: {os.getenv('NVTE_FUSED_ATTN', '1')}\n"
++                    f"  - NVTE_FLEX_ATTN: {os.getenv('NVTE_FLEX_ATTN', '1')}\n"
++                    f"  - NVTE_UNFUSED_ATTN: {os.getenv('NVTE_UNFUSED_ATTN', '1')}\n"
++                    "\n"
++                    "Please run with NVTE_DEBUG=1 NVTE_DEBUG_LEVEL=2 to see detailed reasons.\n"
++                    "\n"
++                    "Common causes:\n"
++                    "  1. All backends disabled via environment variables\n"
++                    "  2. FP8 training disables UnfusedDotProductAttention\n"
++                    "  3. Context parallelism with certain configurations\n"
++                    "  4. THD format with pad_between_seqs\n"
++                    "  5. Unsupported dtype or configuration\n"
+                 )
++                raise ValueError(error_msg)
+ 
+             # run attention
+             if use_flash_attention:
+@@ -1131,6 +1206,19 @@ class DotProductAttention(TransformerEngineBaseModule):
+                     inference_params=inference_params,
+                 )
+ 
++            if use_flex_attention:
++                return self.flex_attention(
++                    query_layer,
++                    key_layer,
++                    value_layer,
++                    qkv_layout=qkv_layout,
++                    attn_mask_type=attn_mask_type,
++                    cu_seqlens_q=cu_seqlens_q,
++                    cu_seqlens_kv=cu_seqlens_kv,
++                    max_seqlen_q=max_seqlen_q,
++                    max_seqlen_kv=max_seqlen_kv,
++                )
++
+             from transformer_engine.pytorch.cpu_offload import CPUOffloadEnabled
+ 
+             if CPUOffloadEnabled:
+diff --git a/transformer_engine/pytorch/attention/dot_product_attention/utils.py b/transformer_engine/pytorch/attention/dot_product_attention/utils.py
+index 7097f4ba..fe1957e1 100644
+--- a/transformer_engine/pytorch/attention/dot_product_attention/utils.py
++++ b/transformer_engine/pytorch/attention/dot_product_attention/utils.py
+@@ -106,7 +106,7 @@ class FlashAttentionUtils:
+     version = PkgVersion("0")
+     version_required = PkgVersion("2.1.1")
+     version_required_blackwell = PkgVersion("2.7.3")
+-    max_version = PkgVersion("2.8.1")
++    max_version = PkgVersion("2.8.3")
+     v2_plus = False
+     v2_1_plus = False
+     v2_3_plus = False
+@@ -276,10 +276,14 @@ def get_attention_backend(
+     ----------
+     use_flash_attention: bool
+         Whether the `FlashAttention` backend has been selected.
++    flash_attention_backend: PkgVersion
++        Flash attention version if `use_flash_attention = True`, else `None`.
+     use_fused_attention: bool
+         Whether the `FusedAttention` backend has been selected.
+     fused_attention_backend: tex.NVTE_Fused_Attn_Backend
+         If `use_fused_attention = True`, one of `FusedAttention` three sub-backends, else `None`.
++    use_flex_attention: bool
++        Whether the `FlexAttention` backend has been selected.
+     use_unfused_attention: bool
+         Whether the `UnfusedDotProductAttention` backend has been selected.
+     available_backends: List[bool]
+@@ -357,6 +361,7 @@ def get_attention_backend(
+     use_flash_attention_3 = use_flash_attention
+     flash_attention_backend = None
+     use_fused_attention = int(os.getenv("NVTE_FUSED_ATTN", "1"))
++    use_flex_attention = int(os.getenv("NVTE_FLEX_ATTN", "1"))
+     use_unfused_attention = int(os.getenv("NVTE_UNFUSED_ATTN", "1"))
+     if not use_flash_attention_2 and FlashAttentionUtils.is_installed:
+         logger.debug("Disabling FlashAttention 2 due to NVTE_FLASH_ATTN=0")
+@@ -364,6 +369,8 @@ def get_attention_backend(
+         logger.debug("Disabling FlashAttention 3 due to NVTE_FLASH_ATTN=0")
+     if not use_fused_attention:
+         logger.debug("Disabling FusedAttention due to NVTE_FUSED_ATTN=0")
++    if not use_flex_attention:
++        logger.debug("Disabling FlexAttention due to NVTE_FLEX_ATTN=0")
+     if not use_unfused_attention:
+         logger.debug("Disabling UnfusedDotProductAttention due to NVTE_UNFUSED_ATTN=0")
+ 
+@@ -919,6 +926,70 @@ def get_attention_backend(
+         bool(available_backends[2]),
+     )
+ 
++    # Filter: FlexAttention constraints
++    # FlexAttention only supports certain mask types and configurations
++    if use_flex_attention:
++        # Check flex_attention availability
++        try:
++            from transformer_engine.pytorch.attention.dot_product_attention.backends import (
++                flex_attention_available
++            )
++            if not flex_attention_available:
++                logger.debug("Disabling FlexAttention: flex_attention not available in PyTorch")
++                use_flex_attention = False
++        except ImportError:
++            logger.debug("Disabling FlexAttention: Could not import flex_attention_available")
++            use_flex_attention = False
++        
++        if use_flex_attention:
++            # Check data type
++            if qkv_dtype not in [torch.bfloat16, torch.float16]:
++                logger.debug(
++                    "Disabling FlexAttention for unsupported qkv_dtype = %s. "
++                    "Supported: qkv_dtype = {torch.bfloat16, torch.float16}",
++                    qkv_dtype,
++                )
++                use_flex_attention = False
++            
++            # Check mask type
++            # Note: padding_causal, padding_causal_bottom_right are treated as causal with padding
++            # FlexAttention can handle these by treating them as causal masks
++            supported_mask_types = [
++                "causal", 
++                "block_causal",
++                "padding_causal",
++                "causal_bottom_right",
++                "padding_causal_bottom_right"
++            ]
++            if attn_mask_type not in supported_mask_types:
++                logger.debug(
++                    "Disabling FlexAttention for unsupported attn_mask_type = %s. "
++                    "Supported: %s",
++                    attn_mask_type,
++                    supported_mask_types,
++                )
++                use_flex_attention = False
++            
++            # Check context parallelism
++            if context_parallel:
++                logger.debug("Disabling FlexAttention: context parallelism not yet fully supported")
++                use_flex_attention = False
++            
++            # Check inference
++            if inference_params is not None:
++                logger.debug("Disabling FlexAttention: inference/KV caching not yet supported")
++                use_flex_attention = False
++            
++            # Check FP8
++            if fp8:
++                logger.debug("Disabling FlexAttention: FP8 not yet supported")
++                use_flex_attention = False
++            
++            # Check ALiBi
++            if core_attention_bias_type == "alibi":
++                logger.debug("Disabling FlexAttention: ALiBi bias not yet supported")
++                use_flex_attention = False
++
+     # Select FusedAttention for performance
+     if use_flash_attention and use_fused_attention and device_compute_capability >= (9, 0):
+         logger.debug(
+@@ -927,17 +998,24 @@ def get_attention_backend(
+         )
+         use_flash_attention = False
+ 
+-    # Selected backend
++    # Selected backend (priority order: Flash -> Fused -> Flex -> Unfused)
+     if use_flash_attention:
+         use_fused_attention = False
++        use_flex_attention = False
+         use_unfused_attention = False
+     elif use_fused_attention:
++        use_flex_attention = False
++        use_unfused_attention = False
++    elif use_flex_attention:
+         use_unfused_attention = False
++    
+     selected_backend = "NoBackend"
+     if use_flash_attention:
+         selected_backend = f"FlashAttention ({str(flash_attention_backend)})"
+     elif use_fused_attention:
+         selected_backend = f"FusedAttention (sub-backend {int(fused_attention_backend)})"
++    elif use_flex_attention:
++        selected_backend = "FlexAttention"
+     elif use_unfused_attention:
+         selected_backend = "UnfusedDotProductAttention"
+     logger.debug("Selected backend = %s", selected_backend)
+@@ -947,6 +1025,7 @@ def get_attention_backend(
+         flash_attention_backend,
+         use_fused_attention,
+         fused_attention_backend,
++        use_flex_attention,
+         use_unfused_attention,
+         available_backends,
+     )

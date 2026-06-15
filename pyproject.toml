@@ -1,0 +1,123 @@
+[build-system]
+requires = [
+    "setuptools>=64",
+    "wheel",
+]
+build-backend = "build_backend"
+backend-path = ["."]
+
+[project]
+name = "axon"
+version = "0.1.0"
+description = "Research stack for lowering agent programs into policy-gradient updates"
+authors = [
+    {name = "Model AI Corp"}
+]
+readme = "README.md"
+requires-python = ">=3.10"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+keywords = ["reinforcement-learning", "language-models", "agents", "post-training"]
+license = {file = "LICENSE"}
+
+# Dependencies are loaded dynamically from setup.py which reads install/*.txt files
+dynamic = ["dependencies", "optional-dependencies"]
+
+[project.scripts]
+axon = "axon.cli:main"
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+extend-exclude = [
+    "checkpoints",
+    "outputs",
+    "logs",
+    "data",
+    "axon/monkey_patches/megatron_flex_attention/**/patch.py",
+]
+
+[tool.ruff.lint]
+isort = {known-first-party = ["axon"]}
+# c.f. https://github.com/vllm-project/vllm/blob/ce8d6b75fc0586045df75ee1568a5b5f9957251b/pyproject.toml
+select = [
+    # pycodestyle
+    "E",
+    # Pyflakes
+    "F",
+    # pyupgrade
+    "UP",
+    # flake8-bugbear
+    "B",
+    # isort
+    "I",
+    "G",
+]
+ignore = [
+    # star imports
+    "F405", "F403",
+    # lambda expression assignment
+    "E731",
+    # long lines (handled by formatter; keep prompts intact)
+    "E501",
+    # Loop control variable not used within loop body
+    "B007",
+    # Abstract base class without abstract methods (intentional for optional overrides)
+    "B024",
+    # f-string format
+    "UP032",
+    # `.log()` statement uses f-string
+    "G004",
+    # equality check using x == True
+    "E712",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"axon/utils/rewards/code_utils/**" = ["ALL"]
+
+[tool.setuptools.packages.find]
+where   = ["."]
+include = ["axon", "axon.*", "recipes", "recipes.*"]
+
+[tool.setuptools.package-data]
+axon = [
+    "config/**/*.yaml",
+    "models/**/*.md",
+    "models/**/*.readme",
+    "monkey_patches/**/*.diff",
+]
+recipes = [
+    "**/*.md",
+    "**/*.sh",
+    "**/*.yaml",
+    "**/*.yml",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "gpu: marks tests that require a CUDA GPU (deselect with '-m \"not gpu\"')",
+    "all: pseudo-marker handled by tests/conftest.py to run CPU and GPU tests",
+]
+
+[tool.mypy]
+plugins = ["pydantic.mypy"]
+ignore_missing_imports = true
+check_untyped_defs = true
+follow_imports = "silent"
+
+exclude = [
+    "axon/utils/rewards/code_utils/.*",
+    "axon/utils/rewards/math_utils/.*",
+    "examples/.*",
+    "scripts/.*",
+    "tests/.*",
+    "docs/.*",
+]

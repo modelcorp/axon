@@ -1,0 +1,132 @@
+site_name: Axon
+site_description: "Reinforcement learning for agentic programs — from a single H100 to multi-node trillion-parameter training, on both FSDP and Megatron-Core."
+site_url: https://axon-rl.readthedocs.io
+repo_url: https://github.com/modelcorp/axon
+repo_name: modelcorp/axon
+docs_dir: docs
+
+theme:
+  name: material
+  logo: assets/axon-mark-dark.svg
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: black
+      accent: indigo
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: black
+      accent: indigo
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+  features:
+    - navigation.instant
+    - navigation.tracking
+    - navigation.tabs
+    - navigation.tabs.sticky
+    - navigation.sections
+    - navigation.top
+    - navigation.indexes
+    - navigation.footer
+    - content.code.copy
+    - content.code.annotate
+    - content.tabs.link
+    - search.suggest
+    - search.highlight
+    - search.share
+    - toc.follow
+  icon:
+    repo: fontawesome/brands/github
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/modelcorp/axon
+
+plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          paths: [.]
+          options:
+            allow_inspection: false
+            docstring_style: google
+            docstring_options:
+              warn_missing_types: false
+            show_source: true
+            show_root_heading: true
+            show_root_toc_entry: true
+            show_signature_annotations: true
+            separate_signature: true
+            show_symbol_type_heading: true
+            show_symbol_type_toc: true
+            members_order: source
+            heading_level: 3
+
+watch:
+  - ./axon/
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - footnotes
+  - tables
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets:
+      base_path: ['.', '..']
+      check_paths: true
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.details
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+
+nav:
+  - Home: index.md
+  - Getting Started:
+      - Installation: getting-started/installation.md
+      - Quickstart: getting-started/quickstart.md
+  - Core Concepts:
+      - Architecture: core-concepts/architecture.md
+      - Execution modes: core-concepts/execution-modes.md
+      - Sampler-trainer agreement: core-concepts/sampler-trainer-agreement.md
+      - Parallelism and performance: core-concepts/parallelism.md
+      - Programs, agents, and tools: core-concepts/programs-agents-and-tools.md
+  - Guides:
+      - Add an algorithm: guides/add-an-algorithm.md
+      - Add a model family: guides/add-a-model.md
+      - Add a program: guides/add-a-program.md
+  - Reference:
+      - CLI: reference/cli.md
+      - Configuration: reference/configuration.md
+      - Algorithms:
+          - Overview: reference/algorithms/index.md
+          - Losses: reference/algorithms/losses.md
+          - Advantages: reference/algorithms/advantages.md
+      - API:
+          - Overview: reference/api/index.md
+          - Core: reference/api/core.md
+          - Programs: reference/api/programs.md
+          - Driver: reference/api/driver.md
+          - Trainer: reference/api/trainer.md
+          - Sampler: reference/api/sampler.md
+          - Engine: reference/api/engine.md
+          - Tools: reference/api/tools.md
+          - Tinker: reference/api/tinker.md
+          - Protocol: reference/api/protocol.md

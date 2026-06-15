@@ -1,0 +1,12 @@
+#!/bin/bash
+# Gemma-4-26B-A4B (MoE) — 1 node × 8 H100s, hybrid, Megatron.
+MODEL_PATH=google/gemma-4-26B-A4B-it
+NUM_NODES=1
+HYBRID_ENGINE=True
+
+TENSOR_MODEL_PARALLEL_SIZE=4
+EXPERT_MODEL_PARALLEL_SIZE=4
+PIPELINE_MODEL_PARALLEL_SIZE=2
+SAMPLER_TENSOR_MODEL_PARALLEL_SIZE=8
+
+source "$(dirname "$0")/_common.sh"

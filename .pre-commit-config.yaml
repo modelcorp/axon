@@ -1,0 +1,9 @@
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: "v0.12.7"
+    hooks:
+      - id: ruff
+        args: ["--fix", "--show-fixes", "--output-format=full"]
+        exclude: ^(checkpoints/|outputs/|logs/|data/)|.*\.(ipynb)$
+      - id: ruff-format
+        exclude: ^(checkpoints/|outputs/|logs/|data/)|.*\.(ipynb)$

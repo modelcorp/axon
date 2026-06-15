@@ -1,0 +1,71 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Git
+.git/
+.git
+.gitignore
+.gitattributes
+
+# CI/CD
+.github/
+
+# Documentation
+docs/
+*.md
+!README.md
+
+# Docker
+Dockerfile*
+.dockerignore
+docker-compose*.yml
+
+# Logs and databases
+*.log
+*.sqlite
+checkpoints/
+outputs/
+logs/
+data/*
+!data/axon-frozenlake
+!data/axon-frozenlake/**
+artifacts/
+.cache/
+.mypy_cache/
+.ruff_cache/
+.venv-pip-audit/
+**/.ipynb_checkpoints
+
+# Misc
+.env
+.env.*
+*.bak
+.pre-commit-config.yaml

@@ -1,0 +1,611 @@
+# Hydra defaults — import trainer and sampler templates directly
+defaults:
+  - trainer/trainer@actor
+  - trainer/trainer@ref
+  - trainer/trainer@critic
+  - trainer/trainer@reward_model
+  - sampler/sampler@sampler
+  - _self_
+
+# =============================================================================
+# Axon Agent PPO Trainer Configuration
+# =============================================================================
+# Self-contained configuration for agent PPO training.
+# Supports both FSDP and Megatron strategies — override `strategy` to switch
+# (e.g., strategy=megatron on the command line).
+# Imports trainer/trainer.yaml and sampler/sampler.yaml templates via Hydra
+# defaults, then applies all overrides below.
+# =============================================================================
+
+# =============================================================================
+# MODEL IDENTITY
+# =============================================================================
+# Path to model weights — inherited by actor, ref, and sampler
+model_path: ~/models/deepseek-llm-7b-chat
+# Whether to trust remote code in HF model / tokenizer configs
+trust_remote_code: false
+# External Python module to import before model init
+external_lib: null
+
+# =============================================================================
+# STRATEGY & DISTRIBUTED
+# =============================================================================
+strategy: fsdp
+
+# Whether actor and sampler share the same GPUs (hybrid/colocated) or run on separate GPU pools (async/disaggregated)
+hybrid_engine: true
+
+# Number of nodes in the cluster
+num_nodes: 1
+
+# Number of GPUs per node
+num_gpus_per_node: 8
+
+# Ratio of sampler GPUs to trainer GPUs.
+sampler_trainer_gpu_ratio: 1
+
+# Whether to enable Ray Collective for distributed communication.
+enable_ray_collective: false
+
+# =============================================================================
+# OUTPUT & LOGGING
+# =============================================================================
+# Used for organizing outputs: {output_dir}/{project_name}/{experiment_name}/...
+output_dir: outputs
+project_name: axon
+experiment_name: agent_ppo
+
+logger:
+- console
+- wandb
+
+# =============================================================================
+# CHECKPOINTING
+# =============================================================================
+
+# Frequency (in steps) to save checkpoints. -1 to disable.
+save_steps: -1
+
+# Resume training from checkpoint. Options:
+#   - false: Train from scratch (ignore existing checkpoints)
+#   - true/auto: Auto-resume from latest valid checkpoint if exists, else train from scratch
+resume_from_checkpoint: true
+
+# Maximum number of checkpoints to keep. Oldest checkpoints are deleted when exceeded.
+# Set to null to keep all checkpoints.
+max_checkpoints_to_keep: null
+
+# Checkpoint save format. Controls what gets saved in checkpoints.
+# Options:
+#   - "sharded": Save sharded state only (model, optimizer, extra) - for resumable training
+#   - "hf": Save HuggingFace format only (hf_model) + sharded optimizer/extra state - for inference/deployment
+#   - "both": Save both sharded state and HuggingFace format (redundant model saved)
+checkpoint_format: hf
+
+# Whether to save checkpoints asynchronously. Only effective for Megatron as of now.
+async_save: false
+
+# =============================================================================
+# TRAINING LOOP
+# =============================================================================
+# Controls trainer mode: "sync" or "async" (default infers from hybrid_engine)
+driver_mode: null
+
+# Mode of operation: "train" for normal training, "eval" for validation only (no training).
+mode: train
+
+# PPO epochs per training step
+ppo_epochs: 1
+
+# PPO mini batch size
+mini_batch_size: 64
+
+# Shuffle mini-batches within PPO epochs
+mini_batch_shuffle: false
+
+# Random seed for reproducible mini-batch shuffling
+mini_batch_seed: 42
+
+# Total RL Training Steps
+total_training_steps: null
+
+# Total RL Training Epochs
+total_epochs: null
+
+# Number of steps to train only the critic before starting actor updates.
+# Set to 0 to disable warmup (train both from the start).
+critic_warmup: 0
+
+# =============================================================================
+# DATA
+# =============================================================================
+# Training Files
+train_files: null
+
+# Per-file sampling weights (parallel to train_files).
+# Controls how frequently each file is sampled. Weights are relative — they
+# don't need to sum to 1.  Example: train_files=[A,B] data_mix=[0.3,0.7]
+data_mix: null
+
+# Validation Files
+val_files: null
+
+# Training Batch Size
+train_batch_size: 64
+
+# Max sequence length — total token budget per training row.
+# This is the single dimension used for all per-position tensors (input_ids,
+# attention_mask, response_mask, logprobs, advantages, etc.).
+# The initial prompt and all model responses / environment observations must
+# fit within this budget.
+max_seq_length: 8192
+
+# Max prompt length — initial-observation truncation threshold.
+# Controls only whether the engine truncates or terminates a program whose
+# initial prompt exceeds this limit.  Does NOT affect tensor dimensions.
+max_prompt_length: 1024
+
+# Prompt truncation mode when initial prompt exceeds max_prompt_length at step 0.
+# Options:
+#   - null: Terminate the program with PROMPT_TRUNCATION (default behavior, program gets dropped)
+#   - "left": Truncate from the left (keep the most recent tokens)
+#   - "right": Truncate from the right (keep the earliest tokens)
+prompt_truncation: null
+
+
+# Enable one-off pipeline
+enable_one_off_pipeline: false
+
+# Enable moe replay
+moe_replay: false
+
+# Enable partial sampler
+partial_rollout:
+
+  # Whether to enable partial sampler
+  enable: false
+
+  # Divides max response length into n_iters to truncate the response.
+  n_iters: 2
+
+# ============================================================================
+# DATA SAMPLER CONFIGURATION
+# ============================================================================
+# Controls how training samples are selected each epoch.
+#
+# Built-in samplers:
+#   - sequential: Iterate through dataset in order
+#   - random: Uniform random sampling (standard training)
+#   - exp_weighted_curriculum: Prioritize harder samples using exponential weights
+#       based on pass_rate. High pass_rate -> low weight, low pass_rate -> high weight.
+#   - threshold_masking_curriculum: Remove "solved" samples from training.
+#       Once a sample's average pass_rate >= threshold, it's permanently excluded.
+#
+# Custom sampler: Provide a path to your class
+#   - file:///path/to/data_sampler.py:MyCustomSampler
+#   - pkg://mypackage.data_samplers:MyCustomSampler
+# ============================================================================
+data_sampler: random
+
+data_sampler_args:
+  # ----- Random Sampler -----
+  seed: 42  # Random seed for reproducibility
+
+  # ----- ExpWeightedCurriculumSampler -----
+  # Weights samples by: exp(-pass_rate + centroid), clamped to [min_weight, max_weight]
+  # Samples with pass_rate > 0.8 get min_weight; pass_rate < 0.2 get max_weight
+  min_weight: 0.2
+
+  max_weight: 1.0
+
+  centroid: 0.0
+
+  # ----- ThresholdMaskingSampler -----
+  # Permanently excludes samples once their average pass_rate >= threshold
+  threshold: 0.9
+
+# =============================================================================
+# DECODING PARAMETERS (training samplers)
+# =============================================================================
+# Top-level decoding parameters for training samplers.
+# These are referenced by sampler config via Hydra interpolation.
+decoding:
+  temperature: 1.0
+  top_k: -1
+  top_p: 1.0
+  repetition_penalty: 1.0
+  n: 1
+  logprobs: 1
+
+  # Temperature scheduling configuration for controlling sampling randomness during training
+  temperature_schedule:
+    # Whether to enable temperature scheduling (gradual change over training steps)
+    enable: false
+    # Type of scheduler: 'linear', 'exponential', 'cosine', etc.
+    scheduler: 'linear'
+    # Initial temperature value at the start.
+    start_temperature: 1.0
+    # Final temperature value at the end of num_steps.
+    end_temperature: 2.0
+    # Number of training steps over which to apply the temperature schedule
+    num_steps: 1000
+
+# =============================================================================
+# VALIDATION
+# =============================================================================
+
+validation:
+  # Frequency (in steps) to run validation. -1 to disable.
+  steps: -1
+
+  # Whether to run validation before training starts.
+  before_train: true
+
+  # Decoding parameters used during validation samplers.
+  decoding:
+    top_k: -1
+    top_p: 1.0
+    temperature: 0
+    'n': 1
+    repetition_penalty: 1.0
+
+# =============================================================================
+# ALGORITHM — Advantage Estimator
+# =============================================================================
+# Advantage estimator
+advantage: loop
+
+# Advantage estimator arguments
+advantage_args:
+
+  # GAE
+  # Discount factor for future rewards
+  gamma: 0.99
+
+  # Trade-off between bias and variance in the GAE estimator
+  lam: 0.95
+
+  # GRPO
+  # Whether to normalize advantages by std
+  norm_adv_by_std: true
+
+  # Numerical stability constant
+  epsilon: 1e-6
+
+  # GPG
+  # Normalization factor for GPG
+  f_norm: 1.0
+
+  # Chunked GAE
+  # Chunk size for chunked_gae parallel prefix scan (reduces sequential steps from T to T/chunk_size)
+  chunk_size: 128
+
+  # Kimi K1.5 length-shaped advantage (arXiv:2501.12599 sec 2.3.3)
+  # 1.0 = paper formula, 0 = disabled (degenerates to GRPO)
+  length_coef: 0.0
+  # Hold coef at 0 for step < warmup_steps
+  length_coef_warmup_steps: 0
+  # Linear ramp after warmup; 0 = paper's hard switch
+  length_coef_ramp_steps: 0
+  # Score >= this counts as correct; lower if reward-level KL shifts scores
+  correct_threshold: 1.0
+
+  # Clip advantages [-1, 1]
+  clip_advantages: false
+
+
+# =============================================================================
+# ALGORITHM — KL in Reward
+# =============================================================================
+# KL penalty type applied to the reward signal (reward shaping).
+# When set, token-level rewards are adjusted: r_t = score_t - beta * KL_t
+# Options: null (disabled), kl, abs, mse, low_var_kl (recommended), full
+kl_reward: null
+
+# KL reward controller arguments (only used when kl_reward is not null).
+kl_reward_args:
+  # "fixed" keeps beta constant; "adaptive" adjusts it to track target_kl.
+  type: fixed
+
+  # Initial (or fixed) KL coefficient.
+  kl_coef: 0.001
+
+  # Adaptive-only: horizon for coefficient updates (larger = slower adaptation).
+  horizon: 10000
+
+  # Adaptive-only: target KL divergence to maintain.
+  target_kl: 0.1
+
+# =============================================================================
+# ALGORITHM — Loss
+# =============================================================================
+loss: ppo
+
+loss_args:
+  # -- General (all algorithms) --
+  # Two-axis loss aggregation: token_reduce × batch_reduce.
+  # token_reduce: how to reduce tokens within each row (B,T)→(B,)
+  #   "sum"          — raw token sum per step (REINFORCE / standard PPO)
+  #   "mean"         — per-step token mean (GRPO, length-independent)
+  #   "mean-norm"    — divide by context length T (fixed-scale, empirically useful)
+  #   "mean-program" — divide by total program tokens (multi-step per-program)
+  # batch_reduce: how to reduce across rows (B,)→scalar
+  #   "token-mean"   — divide by total valid tokens (standard LM/PPO, every token equal)
+  #   "step-mean"    — divide by valid step count (GRPO, every step equal)
+  #   "program-mean" — divide by valid program count (multi-step RL, every program equal)
+  token_reduce: sum
+  batch_reduce: token-mean
+
+  # -- PPO / GSPO / CLIP_COV / GEO_MEAN --
+  # Standard PPO clip range for the probability ratio (symmetric default)
+  clip_ratio: 0.2
+  # Asymmetric lower clip bound; defaults to clip_ratio if null
+  clip_ratio_low: 0.2
+  # Asymmetric upper clip bound; defaults to clip_ratio if null
+  clip_ratio_high: 0.2
+
+  # -- PPO only --
+  # Dual-clip threshold (must be > 1.0); caps the pessimistic objective for negative advantages
+  clip_ratio_c: 3.0
+
+  # -- CISPO only --
+  # Enable unified formulation token-level mask (Eq 7). Drops tokens where the unclipped
+  # ratio exceeds the clip bound in the advantage direction. Disabled = pure CISPO.
+  token_level_mask: false
+
+  # -- CLIP_COV only --
+  # Fraction of tokens selected for covariance-based selective clipping
+  clip_cov_ratio: 0.0002
+  # Lower bound on advantage-logprob covariance for token selection
+  clip_cov_lb: 1.0
+  # Upper bound on advantage-logprob covariance for token selection
+  clip_cov_ub: 5.0
+
+  # -- KL_COV only --
+  # Fraction of high-covariance tokens that receive an additional KL penalty
+  kl_cov_ratio: 0.0002
+  # KL divergence penalty coefficient applied to selected tokens
+  ppo_kl_coef: 0.1
+
+  # -- Critic value clipping --
+  cliprange_value: 0.5
+
+  # -- Entropy bonus --
+  # Coefficient for entropy bonus in the actor loss. Set to 0 to disable.
+  entropy_coef: 0
+
+  # -- KL Loss (auxiliary regularization added to actor loss) --
+  # Coefficient for KL divergence loss term. Set to 0 to disable KL loss.
+  kl_coef: 0.0
+  # KL estimator type for the loss term. Options: kl, abs, mse, low_var_kl (recommended)
+  kl_type: low_var_kl
+
+  # -- Sampler Correction --
+  # Addresses off-policy issues (policy mismatch, model update staleness)
+  # IS weighting mode: null (disabled), "token", or "sequence"
+  sampler_is: null
+  # Upper truncation threshold for IS weights
+  sampler_is_threshold: 2.0
+  # Normalize IS weights to mean=1.0 across batch
+  sampler_is_batch_normalize: false
+  # Rejection sampling mode: null (disabled), "token", "sequence", or "geometric"
+  sampler_rs: null
+  # Upper/lower thresholds for rejection sampling (lower defaults to 1/upper)
+  sampler_rs_threshold: null
+  sampler_rs_threshold_lower: null
+  # Min token-level IS weight before entire sequence is vetoed
+  sampler_token_veto_threshold: null
+
+# =============================================================================
+# AGENT / PROGRAM
+# =============================================================================
+
+# Launch on head
+launch_on_head: true
+
+# Safety limit: maximum generate() calls per program (engine kills program if exceeded).
+# Set very high by default — env.max_turns is the real termination mechanism.
+max_steps: 1000000000
+
+# Max tokens per step
+max_tokens_per_step: null
+
+# Timeout in seconds for program generation
+program_timeout: 10800
+
+# Whether to filter out programs that are too long/timeout/max steps.
+overlong_filter: false
+
+# Whether to drop samples with zero advantage
+drop_zero_advantage_samples: true
+
+# Mode for step-wise advantage calculation: "broadcast" or other modes
+stepwise_advantage_mode: "broadcast"
+
+# Use sampler log probs
+use_sampler_logprobs: false
+
+# Terminates everything if program fails (past retry limit).
+terminate_on_error: false
+
+# Whether to save the chat completion messages during training
+save_programs_flag: true
+
+# Enable strict program filters for training.
+filter_program_errors: false
+
+# Retry limit for each agent program.
+retry_limit: 1
+
+# Whether to use dummy batch for testing/debugging purposes
+use_dummy_batch: false
+
+# Memory stress test: run 2 steps with worst-case (max-length) data through
+# the full pipeline including vLLM sleep/wake, old_log_prob forward, and
+# forward_backward.  Validates that the config won't OOM before committing
+# to a long training run.  Exits after the test with a pass/fail report.
+memory_stress_test: false
+
+# Additional arguments to pass to the agent's engine
+engine_args: {}
+
+# Whether to enable let engine serve through endpoint
+engine_endpoint:
+
+  # Whether to enable engine endpoint
+  enable: false
+
+  # Host for the engine endpoint
+  host: 0.0.0.0
+
+  # Port for the engine endpoint
+  port: 9001
+
+  # Whether to forcefully take the port
+  force_port: True
+
+# Max concurrency (0 means unlimited)
+max_concurrency: 0
+
+# Strategy for inference engine pausing.
+# "drain": wait until in-engine requests are finished, then frees prefix caches.
+# "hold": pause the engine loop, keep decoded tokens, then WILL NOT free prefix caches and existing kv caches
+# "continue": pause the engine loop, keep decoded tokens, then frees prefix caches and existing kv caches
+# "reset": aborts in-engine requests, then frees prefix caches. user side retries.
+sampler_pausing_strategy: "continue"
+
+# For fully async trainer, determines how samplers send data to actor. "nccl" | "ray"
+sampler_channel: "nccl"
+
+# Whether to offload P2P weight-transfer buffers to CPU between transfers (disaggregated mode only)
+offload_p2p_buffer: false
+
+# Program configuration - defines the agent-environment interaction pattern
+program:
+  # Name of the program class to instantiate (e.g., 'react', 'parallel_thought')
+  name: react
+
+# =============================================================================
+# ACTOR OVERRIDES (on top of trainer/trainer.yaml template)
+# =============================================================================
+actor:
+  forward_use_dynamic_bsz: ${oc.select:actor.use_dynamic_bsz,false}
+  forward_max_token_len_per_gpu: ${oc.select:actor.max_token_len_per_gpu,16384}
+  offload_p2p_buffer: ${offload_p2p_buffer}
+
+# =============================================================================
+# REFERENCE POLICY OVERRIDES (forward-only, inherits parallelism from actor)
+# =============================================================================
+ref:
+  forward_only: true
+  param_offload: ${oc.select:actor.param_offload,false}
+  dtype: ${oc.select:actor.dtype,bfloat16}
+  strategy: ${actor.strategy}
+  forward_micro_batch_size: null
+  forward_micro_batch_size_per_gpu: null
+  forward_use_dynamic_bsz: ${oc.select:actor.forward_use_dynamic_bsz,false}
+  forward_max_token_len_per_gpu: ${oc.select:actor.forward_max_token_len_per_gpu,16384}
+  fsdp:
+    ulysses_sequence_parallel_size: ${oc.select:actor.fsdp.ulysses_sequence_parallel_size,1}
+    use_torch_compile: ${oc.select:actor.fsdp.use_torch_compile,true}
+  megatron:
+    tensor_model_parallel_size: ${oc.select:actor.megatron.tensor_model_parallel_size,1}
+    expert_model_parallel_size: ${oc.select:actor.megatron.expert_model_parallel_size,1}
+    expert_tensor_parallel_size: ${oc.select:actor.megatron.expert_tensor_parallel_size,null}
+    pipeline_model_parallel_size: ${oc.select:actor.megatron.pipeline_model_parallel_size,1}
+    virtual_pipeline_model_parallel_size: ${oc.select:actor.megatron.virtual_pipeline_model_parallel_size,null}
+    context_parallel_size: ${oc.select:actor.megatron.context_parallel_size,1}
+    seed: ${oc.select:actor.megatron.seed,42}
+    override_transformer_config: ${oc.select:actor.megatron.override_transformer_config,{}}
+    use_mbridge: ${oc.select:actor.megatron.use_mbridge,false}
+    vanilla_mbridge: ${oc.select:actor.megatron.vanilla_mbridge,true}
+    use_remove_padding: ${oc.select:actor.megatron.use_remove_padding,true}
+
+# =============================================================================
+# SAMPLER OVERRIDES (on top of sampler/sampler.yaml template)
+# =============================================================================
+sampler:
+  offload_p2p_buffer: ${offload_p2p_buffer}
+  max_model_len: ${max_seq_length}
+  profiler:
+    tool: ${oc.select:global_profiler.tool,null}
+    enable: ${oc.select:actor.profiler.enable,false}
+    all_ranks: ${oc.select:actor.profiler.all_ranks,false}
+    ranks: ${oc.select:actor.profiler.ranks,[]}
+    save_path: ${oc.select:global_profiler.save_path,null}
+    tool_config: ${oc.select:actor.profiler.tool_config,null}
+
+# =============================================================================
+# CRITIC OVERRIDES (on top of trainer/trainer.yaml template)
+# =============================================================================
+critic:
+  optimizer_args:
+    lr: 1.0e-05
+  max_token_len_per_gpu: 32768
+  forward_max_token_len_per_gpu: ${.max_token_len_per_gpu}
+  micro_batch_size_per_gpu: ${oc.select:.micro_batch_size,null}
+  use_dynamic_bsz: ${oc.select:actor.use_dynamic_bsz,false}
+  forward_use_dynamic_bsz: ${oc.select:.use_dynamic_bsz,false}
+  forward_micro_batch_size: ${oc.select:.micro_batch_size,null}
+  forward_micro_batch_size_per_gpu: ${oc.select:.micro_batch_size_per_gpu,null}
+  enable: null
+  fsdp:
+    use_remove_padding: false
+  model_path: ~/models/deepseek-llm-7b-chat
+  trust_remote_code: ${oc.select:trust_remote_code,false}
+  external_lib: ${oc.select:external_lib,null}
+
+# =============================================================================
+# REWARD MODEL OVERRIDES (on top of trainer/trainer.yaml template)
+# =============================================================================
+reward_model:
+  enable: false
+  forward_only: true
+  max_token_len_per_gpu: 32768
+  forward_max_token_len_per_gpu: ${oc.select:critic.forward_max_token_len_per_gpu,32768}
+  forward_use_dynamic_bsz: ${oc.select:critic.use_dynamic_bsz,false}
+  use_dynamic_bsz: ${oc.select:critic.use_dynamic_bsz,false}
+  profiler:
+    tool_config: ${oc.select:actor.profiler.tool_config,null}
+  fsdp:
+    use_remove_padding: false
+    enable_gradient_checkpointing: false
+  megatron:
+    use_distributed_optimizer: false
+    seed: ${oc.select:actor.megatron.seed,42}
+    override_transformer_config: ${oc.select:actor.megatron.override_transformer_config,{}}
+    use_mbridge: ${oc.select:actor.megatron.use_mbridge,false}
+    vanilla_mbridge: ${oc.select:actor.megatron.vanilla_mbridge,true}
+    use_remove_padding: ${oc.select:actor.megatron.use_remove_padding,true}
+  model_path: ~/models/FsfairX-LLaMA3-RM-v0.1
+  trust_remote_code: false
+  external_lib: ${oc.select:external_lib,null}
+
+# =============================================================================
+# ADVANCED — Global Profiler
+# =============================================================================
+global_profiler:
+  tool: null
+  steps: null
+  profile_continuous_steps: false
+  save_path: outputs/profile
+  global_tool_config:
+    nsys:
+      discrete: false
+      controller_nsight_options:
+        trace: cuda,nvtx,cublas,ucx
+        cuda-memory-usage: 'true'
+        cuda-graph-trace: graph
+      worker_nsight_options:
+        trace: cuda,nvtx,cublas,ucx
+        cuda-memory-usage: 'true'
+        cuda-graph-trace: graph
+        capture-range: cudaProfilerApi
+        capture-range-end: null
+        kill: none
+    torch_memory:
+      trace_alloc_max_entries: 100000
+      stack_depth: 32
+      context: all
+      stacks: all
+      kw_args: {}

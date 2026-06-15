@@ -1,0 +1,14 @@
+#!/bin/bash
+# GPT-OSS-120B (MoE, softcap attention) — 4 nodes × 8 H100s = 32 GPUs, hybrid, Megatron.
+MODEL_PATH=unsloth/gpt-oss-120b-BF16
+NUM_NODES=4
+HYBRID_ENGINE=True
+
+TENSOR_MODEL_PARALLEL_SIZE=8
+EXPERT_MODEL_PARALLEL_SIZE=8
+PIPELINE_MODEL_PARALLEL_SIZE=4
+SAMPLER_TENSOR_MODEL_PARALLEL_SIZE=8
+
+GPU_MEMORY_UTILIZATION=0.8
+
+source "$(dirname "$0")/_common.sh"
