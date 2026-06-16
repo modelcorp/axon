@@ -213,8 +213,6 @@ class AsyncSamplerMixin:
             Dict of engine and transformation metrics. Contains "skip": True
             if no trainable programs were produced.
         """
-        self.global_steps = global_steps
-
         if self.full_config.use_dummy_batch:
             batch = self.program_processor.create_dummy_batch(self.original_batch, global_steps=global_steps)
             self.replay_buffer = batch
@@ -250,8 +248,13 @@ class AsyncSamplerMixin:
         return metrics
 
     @register(dispatch_mode=Dispatch.RANK_ZERO, execute_mode=Execute.RANK_ZERO, blocking=False, disable_collective=True)
-    async def evaluate_programs(self):
+    async def evaluate_programs(self, global_steps: int = 0):
         """Run validation programs and return evaluation results.
+
+        Args:
+            global_steps: Current training step, supplied by the driver (the owner
+                of the step) and used to tag saved validation programs. 0 for
+                before-train validation (validation.before_train=True).
 
         Returns:
             List of dicts with "reward", "data_source", and "group_id" per program.
@@ -274,7 +277,7 @@ class AsyncSamplerMixin:
 
         if self.full_config.save_programs_flag:
             transformed = [self.program_processor.transform_single_program(p) for p in finished_programs]
-            self.program_processor.save_programs(transformed, self.experiment_dir, self.global_steps, validation=True)
+            self.program_processor.save_programs(transformed, self.experiment_dir, global_steps, validation=True)
 
         return eval_results
 
