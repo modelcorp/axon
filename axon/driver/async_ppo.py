@@ -386,7 +386,7 @@ class AsyncPPO(PPODriverBase):
 
                 _retry_add_batch(self.sampler_wg, test_batch, self.global_steps)
 
-                eval_results_ref = self.sampler_wg.evaluate_programs()
+                eval_results_ref = self.sampler_wg.evaluate_programs(global_steps=self.global_steps)
                 eval_results = ray.get(eval_results_ref)
 
                 for r in eval_results:
